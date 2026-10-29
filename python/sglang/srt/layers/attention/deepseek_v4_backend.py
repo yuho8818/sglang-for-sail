@@ -2805,6 +2805,26 @@ class DeepseekV4AttnBackend(
                 run_indexer=run_indexer,
             )
             return
+        # [TH-S4 baseline-repair candidate] The eager extend path can receive
+        # MLP-sync-padded inputs: _pad_inputs_to_size pads positions/input_ids
+        # to a TP-size multiple but leaves extend_seq_lens at the live count,
+        # so token_req_indices' repeat_interleave(output_size=len(positions))
+        # breaks its sum(repeats) invariant and the device asserts. The
+        # breakable-graph wrapper (bcg_deepseek_v4_low_ratio_sources) slices
+        # to the real token count before calling in; mirror that here for the
+        # eager path (PPU forces prefill CUDA graphs off for V4, so eager is
+        # the default there; CUDA with --disable-cuda-graph hits it too).
+        _real = forward_batch.global_num_token_non_padded_cpu
+        if (
+            _real is not None
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and _real < positions.shape[0]
+        ):
+            x = x[:_real]
+            if q_lora is not None:
+                q_lora = q_lora[:_real]
+            positions = positions[:_real]
         meta = self.forward_metadata
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
