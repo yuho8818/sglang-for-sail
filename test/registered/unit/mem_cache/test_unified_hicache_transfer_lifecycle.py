@@ -164,13 +164,13 @@ def _record_moves(allocator, log: list) -> None:
     """Log every compaction copy on either side into `log`, then perform it."""
     for side in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
         kvcache = side._kvcache
-        move = kvcache.move_kv_cache
+        move = kvcache.move_physical_pages
 
-        def recorded(dst, src, *, move=move, name=side.sub_pool_name):
+        def recorded(dst, src, page_size, *, move=move, name=side.sub_pool_name):
             log.append(("move", name))
-            return move(dst, src)
+            return move(dst, src, page_size)
 
-        kvcache.move_kv_cache = recorded
+        kvcache.move_physical_pages = recorded
 
 
 class _ConfigCase(unittest.TestCase):
@@ -194,12 +194,15 @@ class TestPhysicalReservation(_ConfigCase):
         # The node being loaded: its FULL rows are resident, SWA is tombstoned.
         target = allocator.alloc(2 * PAGE)
         allocator.free_swa(target)
-        allocator.free(gap)
 
+        # The reservation takes the only free SWA rows, at the band's end.
         reserved = swa.alloc_physical(2 * PAGE)
         # Stand in for the H2D copy into the reserved rows.
         rows.swa[reserved] = rows.markers(300, 2 * PAGE)
         allocator.set_full_to_swa_mapping(target, reserved)
+        # An interior hole left after the reservation: once the load is queued,
+        # compaction relocates the reserved rows into it.
+        allocator.free(gap)
 
         moves = []
         _record_moves(allocator, moves)
