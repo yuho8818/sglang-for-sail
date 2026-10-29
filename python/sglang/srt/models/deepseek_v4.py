@@ -3405,7 +3405,19 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             if (
                 x.is_cuda
-                and get_platform().is_blackwell
+                and (
+                    get_platform().is_blackwell
+                    or (
+                        # DSV41-S5.8 port: the same one-CTA-per-row prefill
+                        # fusion, enabled on PPU behind the switch (prefill
+                        # range only; the small decode/verify tile stays on
+                        # the unfused pair).
+                        _is_ppu
+                        and envs.SGLANG_PPU_HC_PREFILL_FUSE.get()
+                        and self.config.model_type == "deepseek_v41"
+                        and 4096 <= x.shape[0] <= 65536
+                    )
+                )
                 and (
                     0 < x.shape[0] <= 96
                     or (
@@ -3536,6 +3548,33 @@ class DeepseekV4DecoderLayer(nn.Module):
                 for coefficient in (pre, post, comb):
                     coefficient.record_stream(main_stream)
             return pre, post, comb
+        if _is_ppu and envs.SGLANG_PPU_HC_SEQ_PARALLEL.get():
+            # DSV41-S5.8 port: route PPU through the fused hc_mix_stats_sinkhorn
+            # with optional row-sharding across the TP group (bit-identical per
+            # row; the all-gather only moves the packed 24-fp32/row
+            # coefficients). DP-attention / CP paths are excluded inside the
+            # helper; with the switch off this branch is not taken and the
+            # generic two-kernel path below runs unchanged.
+            from sglang.kernels.ops.layernorm.hc_seq_parallel import (
+                hc_mix_stats_sinkhorn_seq_parallel,
+            )
+
+            x_flat = x.flatten(1)
+            if x_flat.stride(1) != 1:
+                x_flat = x_flat.contiguous()
+            hc_fn_f32 = hc_fn if hc_fn.dtype == torch.float32 else hc_fn.float()
+            if hc_fn_f32.stride(1) != 1:
+                hc_fn_f32 = hc_fn_f32.contiguous()
+            return hc_mix_stats_sinkhorn_seq_parallel(
+                x_flat,
+                hc_fn_f32,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
         if x.is_cuda and torch.version.cuda is not None:
             # cuBLAS/torch reductions can change order with num_tokens; this kernel
             # keeps the mixing and RMS reductions batch-invariant.

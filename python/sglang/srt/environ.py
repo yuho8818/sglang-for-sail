@@ -1683,6 +1683,24 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # PPU (DSV41-S5.8 port): compute the mHC mixing coefficients through the
+    # fused hc_mix_stats_sinkhorn kernel, row-sharded across the attention-TP
+    # group and all-gathered back (one collective per sublayer boundary, 24
+    # fp32 per row). Rows keep their arithmetic, so the result is bit-identical
+    # to the replicated path; DP-attention / CP paths (whose rows are actually
+    # sharded) are excluded inside the helper. Off: the generic two-kernel
+    # path (hc_mix_stats + hc_split_sinkhorn) runs unchanged.
+    SGLANG_PPU_HC_SEQ_PARALLEL = EnvBool(False)
+    # Minimum number of rows (tokens) before the split pays for the extra
+    # all-gather; below it the replicated fused path runs. Calibrated on
+    # M890P TP8: break-even ~96-128 rows, 3.5x at 768 (c128 decode), 5.1x at
+    # 1536, 4.7x at 8192 (8K prefill).
+    SGLANG_PPU_HC_SEQ_PARALLEL_MIN_TOKENS = EnvInt(128)
+    # PPU (DSV41-S5.8 port): fuse hc_combine + RMSNorm into one CTA-per-row
+    # kernel on prefill batches (the Blackwell hc_combine_norm kernel).
+    # Saves a full [M, hidden] bf16 round-trip per sublayer boundary; within
+    # bf16 rounding of the unfused pair (different fp32 sum order).
+    SGLANG_PPU_HC_PREFILL_FUSE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
