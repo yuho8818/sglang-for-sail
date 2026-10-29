@@ -703,6 +703,20 @@ class ModelConfig:
         )
         if self.is_multimodal and has_dsv41_vision:
             self.is_image_understandable_model = True
+        elif has_dsv41_vision:
+            # Text-only serving (multimodal disabled by the user or by the V4
+            # arg hook, or language_model_only checkpoints): drop the V4.1
+            # vision tower from the config so the model neither builds
+            # the ViT/aligner nor enforces the vision-only parallelism limits.
+            # Every process re-derives ModelConfig from the checkpoint, so the
+            # tokenizer, scheduler and model runner agree on the text-only
+            # layout.
+            logger.info(
+                "Multimodal is disabled for DeepSeek-V4.1; serving text-only "
+                "(vision_n_layers %d -> 0). Pass --enable-multimodal for images.",
+                self.hf_config.vision_n_layers,
+            )
+            self.hf_config.vision_n_layers = 0
 
         # Models expose audio_config at different nesting levels:
         #   - top-level audio_config: e.g. Qwen2Audio
