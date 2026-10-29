@@ -175,6 +175,46 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     )
 
 
+def _resolve_deepseek_v41_vision(server_args: ServerArgs) -> None:
+    """Default DeepSeek-V4.1 to text-only when its vision tower cannot be served.
+
+    The V4.1 ViT/aligner run replicated per rank and are only wired for plain
+    TP/EP: the model raises at construction under DP / CP / PP. When the user
+    did not ask for multimodal explicitly and a blocker fires, disable it here
+    so ModelConfig drops the vision tower (vision_n_layers -> 0) and the text
+    model serves normally. An explicit --enable-multimodal keeps the upstream
+    error, which names the conflicting features.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.enable_multimodal is not None:
+        return
+    model_config = model_config_of(server_args)
+    if getattr(model_config.hf_config, "vision_n_layers", 0) <= 0:
+        return
+
+    blockers = [
+        name
+        for name, enabled in (
+            ("DP attention", cfg.enable_dp_attention or cfg.dp_size > 1),
+            ("context parallelism", cfg.enable_prefill_cp or cfg.attn_cp_size > 1),
+            ("pipeline parallelism", cfg.pp_size > 1),
+        )
+        if enabled
+    ]
+    if not blockers:
+        return
+    logger.warning(
+        "DeepSeek-V4.1 vision does not support %s; serving text-only. "
+        "Pass --enable-multimodal to force the vision tower on.",
+        ", ".join(blockers),
+    )
+    server_args.enable_multimodal = False
+    # Re-derive the memoized ModelConfig so it reflects the text-only layout.
+    server_args._model_config = None
+    server_args._model_config_built_from = None
+    model_config_of(server_args)
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
@@ -187,6 +227,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+
+    _resolve_deepseek_v41_vision(server_args)
     if cfg.enable_encoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
