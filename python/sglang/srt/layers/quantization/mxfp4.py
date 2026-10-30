@@ -1043,6 +1043,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
                 layer._mxfp4_backend = "deep_gemm"
+                if self.use_mega_moe:
+                    # PPU MegaMoE consumes the packed pairs the complete W4A4
+                    # call takes. The layer keeps its grouped-path tensors, so
+                    # the packed copies are extra memory rather than the only
+                    # layout; they are what `fp4_fp4_mega_moe` reads.
+                    from sglang.srt.layers.moe.mega_moe import (
+                        build_ppu_mega_moe_experts_weights,
+                    )
+
+                    build_ppu_mega_moe_experts_weights(layer)
                 torch.cuda.empty_cache()
                 return
 

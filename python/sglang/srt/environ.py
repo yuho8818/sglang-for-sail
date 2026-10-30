@@ -1719,6 +1719,13 @@ class Envs:
     # top_k_per_row_prefill_bf16 kernel (per-row causal windows) instead of
     # the torch einsum + s.topk chain. Off = the torch path, unchanged.
     SGLANG_OPT_PPU_DSV41_PREFILL_INDEXER_NATIVE = EnvBool(False)
+    # PPU W4A4 MegaMoE (TH-S13). When on, `--moe-a2a-backend megamoe` is
+    # accepted on PPU1.5 and routed experts go through DeepGEMM's complete
+    # W4A4 call (`fp4_fp4_mega_moe`): one cross-rank kernel covers dispatch,
+    # GEMM1 + GLU + requantization, GEMM2 and combine. Off leaves the backend
+    # rejected on PPU, so the default grouped-GEMM path and its numerics are
+    # untouched.
+    SGLANG_OPT_PPU_DSV41_MEGAMOE = EnvBool(False)
     # PPU DSV4.1 native FP8 sparse prefill attention (DSV41-S5.1 port): layers
     # 2-35 of the sparse prefill dispatch to FlashMLA's quantized sparse kernel
     # (bf16 Q quantized in-kernel, KV workspace in E4M3, FP8 tensor-core QK/PV)

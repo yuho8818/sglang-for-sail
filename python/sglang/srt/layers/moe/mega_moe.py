@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
@@ -56,7 +57,20 @@ def _use_amd_flydsl_mega_moe() -> bool:
 def _mega_moe_mma_type(experts=None) -> str:
     if experts is not None and experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
+    if _use_ppu_mega_moe():
+        return "fp4xfp4"
     return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
+
+
+def _use_ppu_mega_moe() -> bool:
+    """PPU1.5 runs MegaMoE with DeepGEMM's complete W4A4 call.
+
+    PPU's kernel family is MXFP4 x MXFP4 (``fp4_fp4_mega_moe``) with one
+    cross-rank call covering dispatch, GEMM1 + GLU + requantization, GEMM2 and
+    combine, instead of the SM100 host-side pipeline. Gated on the switch so
+    the default PPU MoE path keeps its numerics bit-for-bit.
+    """
+    return bool(envs.SGLANG_OPT_PPU_DSV41_MEGAMOE.get() and _is_ppu)
 
 
 @functools.lru_cache(maxsize=1)
@@ -150,11 +164,57 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
+def _get_ppu_mega_moe_symm_buffer(
+    group,
+    num_experts: int,
+    num_max_tokens_per_rank: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+) -> SymmBuffer:
+    """PPU workspace: one W4A4 allocation shared by every layer.
+
+    PPU has no shared-expert slot, so ``num_shared_experts`` stays 0, and the
+    dispatch packs FP4 activations, so ``use_fp8_dispatch`` is off. Reusing one
+    buffer keeps the cross-rank handshake state single-owner, which the kernel
+    requires when layers run back-to-back on one stream.
+    """
+    import deep_gemm
+
+    key = (
+        id(group),
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+        "fp4xfp4",
+    )
+    buf = _MEGA_MOE_SYMM_BUFFER.get(key)
+    if buf is None:
+        buf = deep_gemm.get_symm_buffer_for_mega_moe(
+            group,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+            num_shared_experts=0,
+            use_fp8_dispatch=False,
+            mma_type="fp4xfp4",
+            activation="swiglu",
+        )
+        _MEGA_MOE_SYMM_BUFFER[key] = buf
+    return buf
+
+
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
+    if _use_ppu_mega_moe():
+        return getattr(experts, "ppu_mega_moe_weights_built", False)
     # The SM100 mega kernels exist for compute capability 10.x only.
     return _device_sm // 10 == 10
 
@@ -309,6 +369,21 @@ def run_mega_routed_experts(
     )
 
     mma_type = _mega_moe_mma_type(experts)
+    if _use_ppu_mega_moe():
+        return run_ppu_mega_routed_experts(
+            experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            num_tokens=num_tokens,
+            activation_clamp=activation_clamp,
+            routed_scaling_factor=routed_scaling_factor,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+        )
+
     buf = _get_mega_moe_symm_buffer(
         ep_group,
         num_experts=num_experts,
@@ -416,6 +491,127 @@ def run_mega_routed_experts(
     return y
 
 
+def run_ppu_mega_routed_experts(
+    experts,
+    hidden_states: torch.Tensor,
+    topk_ids: Optional[torch.Tensor],
+    topk_weights: Optional[torch.Tensor],
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_tokens: int,
+    activation_clamp: Optional[float] = None,
+    routed_scaling_factor: float = 1.0,
+    num_max_tokens_per_rank: Optional[int] = None,
+) -> torch.Tensor:
+    """PPU1.5 W4A4 MegaMoE: one complete cross-rank call per layer.
+
+    ``fp4_fp4_mega_moe`` consumes the packed MXFP4 activations staged by
+    ``mega_moe_pre_dispatch`` into the symmetric workspace and writes the
+    combined BF16 rows, so unlike the SM100 path there is no host-side
+    dispatch, grouped GEMM or combine to drive here. Inputs are this rank's
+    tokens; the returned rows are fully reduced.
+    """
+    import deep_gemm
+
+    from sglang.srt.runtime_context import get_parallel
+
+    if num_max_tokens_per_rank is None:
+        num_max_tokens_per_rank = (
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        )
+    # PPU keeps the full intermediate width: there is no shared-expert slot in
+    # the workspace, and the fused call derives GEMM1's 2I from the L1 weights.
+    assert intermediate_size == experts.mega_l1_weights[0].shape[1] // 2
+
+    ep_group = get_parallel().moe_ep_group.device_group
+    buf = _get_ppu_mega_moe_symm_buffer(
+        ep_group,
+        num_experts=experts.num_experts,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        num_topk=top_k,
+        hidden=hidden_size,
+        intermediate_hidden=intermediate_size,
+    )
+
+    # The PPU kernels validate int64 routing indices and reject duplicates
+    # among the valid physical expert IDs within one token's top-k; masked
+    # slots (-1) may repeat. The router already emits that shape, so this only
+    # fixes the dtype/layout the kernel demands.
+    if num_tokens > 0:
+        topk_ids_in = topk_ids.to(torch.int64).contiguous()
+        topk_weights_in = topk_weights.to(torch.float32).contiguous()
+    else:
+        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int64)
+        topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+
+    # Activation clamp is a SwiGLU gate/up bound; 0.0 means unbounded to the
+    # kernel, so an unfused config maps to "no clamp".
+    clamp = 0.0 if activation_clamp is None else float(activation_clamp)
+    _trace_ppu_mega_moe_call(
+        num_tokens=num_tokens,
+        num_experts=experts.num_experts,
+        top_k=top_k,
+        hidden=hidden_size,
+        intermediate=intermediate_size,
+    )
+
+    deep_gemm.mega_moe_pre_dispatch(
+        hidden_states,
+        topk_ids_in,
+        topk_weights_in,
+        buf,
+        num_tokens=num_tokens,
+    )
+    y = torch.empty(
+        (max(num_tokens, 1), hidden_size),
+        dtype=torch.bfloat16,
+        device=hidden_states.device,
+    )
+    deep_gemm.fp4_fp4_mega_moe(
+        y,
+        experts.mega_l1_weights,
+        experts.mega_l2_weights,
+        buf,
+        activation="swiglu",
+        activation_clamp=clamp,
+        fast_math=True,
+    )
+    y = y[:num_tokens]
+
+    if routed_scaling_factor != 1.0:
+        y.mul_(routed_scaling_factor)
+    return y
+
+
+_PPU_MEGA_MOE_TRACED = False
+
+
+def _trace_ppu_mega_moe_call(
+    *, num_tokens: int, num_experts: int, top_k: int, hidden: int, intermediate: int
+) -> None:
+    """Announce the first PPU MegaMoE call so a run can be told apart from the
+    grouped-GEMM default in the server log."""
+    global _PPU_MEGA_MOE_TRACED
+    if _PPU_MEGA_MOE_TRACED:
+        return
+    _PPU_MEGA_MOE_TRACED = True
+    try:
+        import torch.distributed as dist
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+    except Exception:  # noqa: BLE001 - tracing must never break the forward
+        rank = 0
+    from sglang.srt.utils.common import log_info_on_rank0
+
+    log_info_on_rank0(
+        f"[TH-S13][mega-moe] PPU W4A4 MegaMoE engaged: fp4_fp4_mega_moe rank={rank} "
+        f"num_tokens={num_tokens} experts={num_experts} top_k={top_k} "
+        f"hidden={hidden} intermediate={intermediate}"
+    )
+
+
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     # Match DeepGEMM's L1 gate/up layouts. FP8 activations use contiguous
     # gran-8 chunks; packed MXFP4 activations use even/odd gran-16 chunks.
@@ -462,6 +658,10 @@ def build_mega_moe_experts_weights(experts) -> None:
         )
 
         build_flydsl_mega_moe_weights(experts)
+        return
+
+    if _use_ppu_mega_moe():
+        build_ppu_mega_moe_experts_weights(experts)
         return
 
     from deep_gemm import (
@@ -521,4 +721,69 @@ def build_mega_moe_experts_weights(experts) -> None:
     experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
     experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
 
+    experts._mega_moe_weights_built = True
+
+
+def _data(t):
+    """The tensor behind a module attribute (Parameter/tensor), or None."""
+    return getattr(t, "data", t) if torch.is_tensor(t) else None
+
+
+def _as_uint8(t):
+    """Reinterpret a packed nibble/byte tensor as raw uint8, the only spelling
+    ``transform_weights_for_mega_moe`` accepts. Both MXFP4 e2m1 weights and
+    UE8M0 scales carry the same bits whichever view the loader left them in."""
+    return _data(t).view(torch.uint8).contiguous()
+
+
+def build_ppu_mega_moe_experts_weights(experts) -> None:
+    """Pack the checkpoint's MXFP4 experts into the PPU MegaMoE layouts.
+
+    ``transform_weights_for_mega_moe`` returns the pair the complete call
+    takes: the L1 gate/up weight interleaved for the fused G1 kernel and the
+    UE8M0 scales in the layout both GEMMs expect. The layer keeps its
+    ``w13_weight`` used by the grouped paths; the packed pairs get their own
+    parameters, so unloading the checkpoint tensors frees the originals before
+    the next layer converts.
+    """
+    if getattr(experts, "ppu_mega_moe_weights_built", False):
+        return
+
+    import torch.nn as nn
+    from deep_gemm import transform_weights_for_mega_moe
+
+    w13 = getattr(experts, "w13_weight", None)
+    w2 = getattr(experts, "w2_weight", None)
+    w13_sf = getattr(experts, "w13_weight_scale", None) or getattr(
+        experts, "w13_weight_scale_inv", None
+    )
+    w2_sf = getattr(experts, "w2_weight_scale", None) or getattr(
+        experts, "w2_weight_scale_inv", None
+    )
+    if not all(torch.is_tensor(t) for t in (w13, w2, w13_sf, w2_sf)):
+        raise ValueError(
+            "PPU MegaMoE needs packed MXFP4 experts (e2m1 weights + UE8M0 "
+            "group-32 scales); got "
+            f"w13={getattr(w13, 'dtype', None)}, w2={getattr(w2, 'dtype', None)}, "
+            f"w13_scale={getattr(w13_sf, 'dtype', None)}, "
+            f"w2_scale={getattr(w2_sf, 'dtype', None)}"
+        )
+    if _device_sm != 89:
+        raise RuntimeError("PPU MegaMoE requires PPU1.5 (compute capability 8.9)")
+
+    l1_pair, l2_pair = transform_weights_for_mega_moe(
+        (_as_uint8(w13), _as_uint8(w13_sf)),
+        (_as_uint8(w2), _as_uint8(w2_sf)),
+        activation="swiglu",
+    )
+
+    for name, value in (("mega_l1_weights", l1_pair), ("mega_l2_weights", l2_pair)):
+        for index, tensor in enumerate(value):
+            param = nn.Parameter(tensor, requires_grad=False)
+            setattr(experts, f"{name}_{index}", param)
+        # Tuple views the forward reads; rebuilt on demand if a loader swaps
+        # the parameters (see the aggregate below).
+        setattr(experts, name, value)
+
+    experts.ppu_mega_moe_weights_built = True
     experts._mega_moe_weights_built = True
