@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.environ import envs
+
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
@@ -52,6 +54,17 @@ class FullTopKIndexer:
     def topk_prefill(self, inputs: PrefillInputs, out: Selection) -> None:
         if self.use_deep_gemm_prefill:
             self._deep_gemm_prefill(inputs, out)
+        elif envs.SGLANG_OPT_PPU_DSV41_PREFILL_INDEXER_NATIVE.get():
+            from sglang.srt.layers.attention.dsv4.prefill_indexer_ppu import (
+                topk_prefill_ppu,
+            )
+
+            topk_prefill_ppu(
+                inputs=inputs,
+                out=out,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+            )
         else:
             self._torch_prefill(inputs, out)
 
@@ -131,6 +144,14 @@ class FullTopKIndexer:
         )
 
     def _torch_decode(self, inputs: DecodeInputs, out: Selection) -> None:
+        from sglang.srt.layers.attention.dsv4.indexer_row_shard import (
+            maybe_indexer_row_shard,
+        )
+
+        shard = maybe_indexer_row_shard(inputs.req_rows.shape[0])
+        if shard is not None:
+            self._torch_decode_sharded(inputs, out, shard)
+            return
         for d in decode_score_chunks(
             inputs=inputs,
             out=out,
@@ -141,6 +162,57 @@ class FullTopKIndexer:
             idx = d.scores.topk(k, dim=-1, sorted=False).indices
             write_decode(out, d, idx)
             del d  # release this chunk's logits before the next chunk is scored
+
+    def _torch_decode_sharded(
+        self, inputs: DecodeInputs, out: Selection, shard
+    ) -> None:
+        """Row-sharded ``_torch_decode`` (DSV41-S5.9 port): each rank scores
+        only its contiguous share of the query rows and the selections are
+        all-gathered back; a gathered selection is bitwise the replicated
+        one (every step below is row-independent)."""
+        rows = shard.local_rows(inputs.req_rows.shape[0])
+        n_local = rows.stop - rows.start
+        local = DecodeInputs(
+            indexer=inputs.indexer,
+            layer_id=inputs.layer_id,
+            compress_ratio=inputs.compress_ratio,
+            freqs_cis=inputs.freqs_cis,
+            x=inputs.x[rows],
+            q_lora=inputs.q_lora[rows],
+            positions=inputs.positions[rows],
+            req_rows=inputs.req_rows[rows],
+            paged_metadata=inputs.paged_metadata,
+            is_verify=inputs.is_verify,
+        )
+        k = min(inputs.indexer.index_topk, out.page_indices.shape[1])
+        staged = Selection(
+            page_indices=out.page_indices.new_full(
+                (shard.rows_per_rank(inputs.req_rows.shape[0]), k), -1
+            ),
+            raw_indices=(
+                out.raw_indices.new_full(
+                    (shard.rows_per_rank(inputs.req_rows.shape[0]), k), -1
+                )
+                if out.raw_indices is not None
+                else None
+            ),
+        )
+        if n_local > 0:
+            d = decode_scores(
+                inputs=local,
+                out=staged,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+            )
+            if d is not None:
+                idx = d.scores.topk(k, dim=-1, sorted=False).indices
+                write_decode(staged, d, idx)
+        num_rows = inputs.req_rows.shape[0]
+        out.page_indices[:num_rows] = shard.gather(staged.page_indices, num_rows)
+        if out.raw_indices is not None:
+            out.raw_indices[:num_rows] = shard.gather(
+                staged.raw_indices, num_rows
+            )
 
     def _deep_gemm_prefill_captured(
         self, inputs: CapturedPrefillInputs, out: Selection

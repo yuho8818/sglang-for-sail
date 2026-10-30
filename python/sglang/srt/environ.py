@@ -1703,6 +1703,22 @@ class Envs:
     # Saves a full [M, hidden] bf16 round-trip per sublayer boundary; within
     # bf16 rounding of the unfused pair (different fp32 sum order).
     SGLANG_PPU_HC_PREFILL_FUSE = EnvBool(False)
+    # DSV4.1 indexer decode/verify TP row shard (DSV41-S5.9 port). The
+    # low-ratio indexer projections are replicated across attention TP, so
+    # every rank scores every verify row identically. When on, each rank
+    # scores only its contiguous share of the rows and the top-k selections
+    # are all-gathered back to full width; the index-K compute and cache
+    # writes stay replicated on every rank. Off = the replicated path.
+    SGLANG_OPT_DSV4_INDEXER_TP_SHARD = EnvBool(False)
+    # Minimum decode/verify query rows for the shard above to engage; below
+    # it the all-gather's fixed latency eats most of what sharding saves.
+    SGLANG_OPT_DSV4_INDEXER_TP_SHARD_MIN_ROWS = EnvInt(48)
+    # PPU DSV4.1 low-ratio prefill indexer native score + top-k (DSV41-S5.11
+    # port). When on, PPU extend batches score the ratio-1/2 indexer with
+    # deep_gemm.bf16_mqa_logits and select the top-k with the existing
+    # top_k_per_row_prefill_bf16 kernel (per-row causal windows) instead of
+    # the torch einsum + s.topk chain. Off = the torch path, unchanged.
+    SGLANG_OPT_PPU_DSV41_PREFILL_INDEXER_NATIVE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
