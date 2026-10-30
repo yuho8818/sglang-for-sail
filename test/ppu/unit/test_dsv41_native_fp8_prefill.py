@@ -119,8 +119,14 @@ class TestBackendSwitchContract(unittest.TestCase):
     def setUp(self):
         self.source = ast.unparse(_function_node(BACKEND, "_forward_prefill_sparse"))
 
-    def test_gate_guarded_by_is_ppu(self):
-        self.assertIn("if _is_ppu:", self.source)
+    def test_gate_guarded_by_import_time_probe(self):
+        # The per-layer decision is behind an import-time probe so the bf16
+        # path pays nothing when the switch is off.
+        self.assertIn("if p_ppu_native_fp8_applies:", self.source)
+        self.assertIn(
+            "p_ppu_native_fp8_applies",
+            (PPU_ATTENTION / "flash_mla.py").read_text(),
+        )
         self.assertIn(
             "SGLANG_OPT_PPU_DSV4_NATIVE_FP8_PREFILL",
             (ROOT / "python/sglang/srt/environ.py").read_text(),

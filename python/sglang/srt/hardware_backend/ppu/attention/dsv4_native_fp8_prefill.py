@@ -86,12 +86,14 @@ def native_fp8_prefill_applies(
     layer_id: int,
     q: torch.Tensor,
     head_dim_v: int,
-    indices: torch.Tensor,
+    indices: Optional[torch.Tensor] = None,
 ) -> bool:
     """Cheap admission test; the caller falls back to bf16 when it fails.
 
-    ``q`` is the squeezed ``(s_q, h_q, d_qk)`` query block and ``indices`` the
-    combined ``(s_q, 1, topk)`` key list the sparse prefill already built.
+    ``q`` is the squeezed ``(s_q, h_q, d_qk)`` query block. ``indices`` is the
+    combined ``(s_q, 1, topk)`` key list: pass ``None`` for the pre-workspace
+    decision, which then checks everything except the exact top-k width (the
+    backend re-runs this with the real list before allocating the workspace).
     """
     if not _native_fp8_enabled():
         return False
@@ -104,11 +106,12 @@ def native_fp8_prefill_applies(
         return False
     if d_qk != _D_V or head_dim_v != _D_V:
         return False
-    if indices.ndim != 3 or indices.shape[0] != s_q or indices.shape[1] != 1:
-        return False
-    topk = indices.shape[-1]
-    if topk <= 0 or topk % 64 != 0 or topk > _MAX_TOPK:
-        return False
+    if indices is not None:
+        if indices.ndim != 3 or indices.shape[0] != s_q or indices.shape[1] != 1:
+            return False
+        topk = indices.shape[-1]
+        if topk <= 0 or topk % 64 != 0 or topk > _MAX_TOPK:
+            return False
     return _probe()[0]
 
 
@@ -157,7 +160,4 @@ def flash_mla_sparse_quantized_prefill(
         out=out,
         # The backend consumes only the output row block.
         compute_aux=False,
-        # The combined index list carries arbitrary -1 entries, so the kernel
-        # must mask them instead of trusting a dense prefix.
-        trusted_full_topk=False,
     )

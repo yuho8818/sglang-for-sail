@@ -3709,25 +3709,24 @@ class DeepseekV4AttnBackend(
 
         # Native FP8 admission (SGLANG_OPT_PPU_DSV4_NATIVE_FP8_PREFILL, off by
         # default) precedes workspace construction because the quantized kernel
-        # wants an e4m3 KV workspace. The SWA-only index list already exists at
-        # this point, so the decision never costs the bf16 path a cache build.
+        # wants an e4m3 KV workspace. The gate only inspects the query shape, so
+        # it never costs the bf16 path a cache build; the exact top-k width is
+        # confirmed below once the per-ratio index list exists.
         native_fp8 = False
         native_fn = None
-        if _is_ppu:
+        if p_ppu_native_fp8_applies:
             from sglang.srt.hardware_backend.ppu.attention.flash_mla import (
                 flash_mla_sparse_quantized_prefill,
                 native_fp8_prefill_applies,
             )
 
-            prebuilt_cache = self.forward_metadata.sparse_prefill_cache
-            if compress_ratio == 0 and prebuilt_cache is not None:
-                native_fp8 = native_fp8_prefill_applies(
-                    layer_id,
-                    q_flat,
-                    self.head_dim_v,
-                    prebuilt_cache.c0_combined_indices.unsqueeze(1),
-                )
-                native_fn = flash_mla_sparse_quantized_prefill
+            native_fp8 = native_fp8_prefill_applies(
+                layer_id=layer_id,
+                q=q_flat,
+                head_dim_v=self.head_dim_v,
+                indices=None,
+            )
+            native_fn = flash_mla_sparse_quantized_prefill
         kv_dtype = fp8_dtype if native_fp8 else torch.bfloat16
 
         cache = self.forward_metadata.sparse_prefill_cache
@@ -3744,11 +3743,21 @@ class DeepseekV4AttnBackend(
         extra_page_size = None
         flat_token_ids = None
         if compress_ratio == 0:
+            combined_indices = cache.c0_combined_indices
+            combined_lens = cache.c0_combined_lens
+            if native_fp8:
+                # Exact slot width decides: a wider combined list than the
+                # quantized kernel accepts falls back to bf16 for this call.
+                native_fp8 = native_fp8_prefill_applies(
+                    layer_id=layer_id,
+                    q=q_flat,
+                    head_dim_v=self.head_dim_v,
+                    indices=combined_indices.unsqueeze(1),
+                )
+                kv_dtype = fp8_dtype if native_fp8 else torch.bfloat16
             workspace = self.sparse_prefill_workspace.get(
                 cache.swa_token_ids.shape[0], dtype=kv_dtype
             )
-            combined_indices = cache.c0_combined_indices
-            combined_lens = cache.c0_combined_lens
             swa_slice = workspace
         else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
@@ -3761,7 +3770,10 @@ class DeepseekV4AttnBackend(
                 # Compressed ratios decide on the full slot width, once the
                 # per-layer index list exists.
                 native_fp8 = native_fp8_prefill_applies(
-                    layer_id, q_flat, self.head_dim_v, combined_indices.unsqueeze(1)
+                    layer_id=layer_id,
+                    q=q_flat,
+                    head_dim_v=self.head_dim_v,
+                    indices=combined_indices.unsqueeze(1),
                 )
                 kv_dtype = fp8_dtype if native_fp8 else torch.bfloat16
             workspace = self.sparse_prefill_workspace.get(

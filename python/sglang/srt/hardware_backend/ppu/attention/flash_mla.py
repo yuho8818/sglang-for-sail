@@ -11,6 +11,7 @@ flash_mla_sparse_fwd
 flash_mla_sparse_quantized_prefill
 native_fp8_prefill_supported
 native_fp8_prefill_applies
+p_ppu_native_fp8_applies
 """
 
 from typing import Optional, Tuple
@@ -234,6 +235,30 @@ def native_fp8_prefill_applies(
     return dsv4_native_fp8_prefill.native_fp8_prefill_applies(
         layer_id, q, head_dim_v, indices
     )
+
+
+def _compute_native_fp8_prefill_applies() -> bool:
+    """Import-time gate: switch, wheel API and layer range constraints only.
+
+    Evaluated once at import so the per-layer decision costs nothing on the
+    bf16 path: with the switch off it is a plain ``False`` and the backend
+    skips the admission call entirely.
+    """
+    if _import_error is not None:
+        return False
+    from sglang.srt.environ import envs as _envs
+
+    if not _envs.SGLANG_OPT_PPU_DSV4_NATIVE_FP8_PREFILL.get():
+        return False
+    from sglang.srt.hardware_backend.ppu.attention.dsv4_native_fp8_prefill import (
+        native_fp8_prefill_supported,
+    )
+
+    return native_fp8_prefill_supported()
+
+
+#: Whether the native FP8 sparse prefill can engage in this process at all.
+p_ppu_native_fp8_applies = _compute_native_fp8_prefill_applies()
 
 
 def flash_mla_sparse_quantized_prefill(
