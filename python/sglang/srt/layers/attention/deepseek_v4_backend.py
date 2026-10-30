@@ -3699,6 +3699,13 @@ class DeepseekV4AttnBackend(
     ) -> torch.Tensor:
         """Gathers each request's SWA window and c4/c128 cache into a flat bf16
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
+        # The probe resolves once, at import of the PPU wrapper, so it must be
+        # bound before the admission test below; importing it inside that branch
+        # would leave the test reading an unbound name.
+        from sglang.srt.hardware_backend.ppu.attention.flash_mla import (
+            p_ppu_native_fp8_applies,
+        )
+
         if _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
         else:
