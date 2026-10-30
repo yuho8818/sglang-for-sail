@@ -1,3 +1,4 @@
+import inspect
 import logging
 
 from sglang.srt.environ import envs
@@ -68,6 +69,16 @@ DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa or _is_
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:
+    """Whether this DeepGEMM build indexes K in pages wider than 64 slots.
+
+    The indexer pool page length follows this flag (128 when set, else 64), so
+    a build that exports the sparse entry points but whose scheduler still
+    asserts ``block_kv == 64`` must not report support: the pool would then be
+    allocated at 128 and every paged indexer metadata build would raise.
+    PPU builds before the sparse scheduler landed carry the symbol but keep the
+    assertion, so require the symbol *and* a scheduler that takes its block
+    width from the caller.
+    """
     if _is_ppu:
         if not ENABLE_JIT_DEEPGEMM or get_device_sm() < 89:
             return False
@@ -75,13 +86,23 @@ def _supports_paged_sparse_mqa_logits() -> bool:
         return False
     import deep_gemm
 
-    return all(
+    if not all(
         callable(getattr(deep_gemm, name, None))
         for name in (
             "get_paged_sparse_mqa_logits_metadata",
             "fp8_fp4_paged_sparse_mqa_logits",
         )
-    )
+    ):
+        return False
+
+    # The scheduler that hard-codes 64 slots has no sparse-block parameter; the
+    # one that accepts caller page widths does.
+    metadata_fn = getattr(deep_gemm, "get_paged_sparse_mqa_logits_metadata", None)
+    try:
+        params = inspect.signature(metadata_fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "sparse_block_kv" in params
 
 
 DEEPGEMM_PAGED_SPARSE_MQA_LOGITS = _supports_paged_sparse_mqa_logits()
