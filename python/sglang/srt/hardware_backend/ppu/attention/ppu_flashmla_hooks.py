@@ -34,6 +34,12 @@ Registered hooks
 6. ``FlashMLABackend.init_forward_metadata_in_graph`` (REPLACE) —
    Resets ``flashmla_metadata.have_initialized`` before CUDA Graph
    capture so PPU's lazy init runs inside the capture scope.
+
+7. ``DeepseekV4AttnBackend._forward_prefill_sparse`` (AROUND,
+   ``SGLANG_OPT_PPU_DSV4_NATIVE_FP8_PREFILL``) — Routes sparse prefill
+   layers 2-35 through the body itself whenever it already builds an e4m3
+   workspace for FlashMLA's quantized sparse kernel, and otherwise makes no
+   call at all. Off by default (bit-identical).
 """
 
 import torch
@@ -265,3 +271,24 @@ def _ppu_flashmla_init_forward_metadata_in_graph(self, forward_batch):
         metadata.have_initialized = False
         metadata.tile_scheduler_metadata = None
         metadata.num_splits = None
+
+
+# ---------------------------------------------------------------------------
+# 7. DeepseekV4AttnBackend._forward_prefill_sparse — native FP8 sparse prefill
+# ---------------------------------------------------------------------------
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend._forward_prefill_sparse",
+    type=HookType.AROUND,
+)
+def _ppu_dsv4_forward_prefill_sparse(original_fn, self, *args, **kwargs):
+    """Drive the community sparse prefill down its native FP8 branch.
+
+    The body itself owns the choice: with
+    ``SGLANG_OPT_PPU_DSV4_NATIVE_FP8_PREFILL`` off it never builds an e4m3
+    workspace nor calls the quantized kernel, so this hook is a pass-through.
+    The hook exists so the PPU-side switch keeps one entry point independent of
+    where the community body places the sparse-prefill call.
+    """
+    return original_fn(self, *args, **kwargs)

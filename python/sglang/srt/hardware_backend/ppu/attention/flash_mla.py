@@ -8,6 +8,9 @@ Exported symbols
 get_mla_metadata
 flash_mla_with_kvcache
 flash_mla_sparse_fwd
+flash_mla_sparse_quantized_prefill
+native_fp8_prefill_supported
+native_fp8_prefill_applies
 """
 
 from typing import Optional, Tuple
@@ -198,4 +201,63 @@ def flash_mla_sparse_fwd(
         d_v=d_v,
         attn_sink=attn_sink,
         topk_length=topk_length,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Native FP8 sparse prefill (SGLANG_OPT_PPU_DSV4_NATIVE_FP8_PREFILL)
+#
+# Thin seam over dsv4_native_fp8_prefill: the backend asks ``applies`` before
+# building an e4m3 workspace, and calls ``prefill`` instead of
+# ``flash_mla_sparse_fwd`` when it admits. Both are no-ops with the switch off.
+# ---------------------------------------------------------------------------
+
+
+def native_fp8_prefill_supported() -> bool:
+    """Whether the installed FlashMLA wheel carries the quantized sparse API."""
+    from sglang.srt.hardware_backend.ppu.attention import dsv4_native_fp8_prefill
+
+    return dsv4_native_fp8_prefill.native_fp8_prefill_supported()
+
+
+def native_fp8_prefill_applies(
+    layer_id: int,
+    q: torch.Tensor,
+    head_dim_v: int,
+    indices: torch.Tensor,
+) -> bool:
+    """Admission test for the native FP8 sparse prefill; always False when off."""
+    if _import_error is not None:
+        return False
+    from sglang.srt.hardware_backend.ppu.attention import dsv4_native_fp8_prefill
+
+    return dsv4_native_fp8_prefill.native_fp8_prefill_applies(
+        layer_id, q, head_dim_v, indices
+    )
+
+
+def flash_mla_sparse_quantized_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sparse FP8 prefill over a flat KV workspace; see the implementation module."""
+    if _import_error is not None:
+        raise _IMPORT_ERROR from _import_error
+    from sglang.srt.hardware_backend.ppu.attention import dsv4_native_fp8_prefill
+
+    return dsv4_native_fp8_prefill.flash_mla_sparse_quantized_prefill(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        out=out,
     )

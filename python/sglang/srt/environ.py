@@ -1719,6 +1719,14 @@ class Envs:
     # top_k_per_row_prefill_bf16 kernel (per-row causal windows) instead of
     # the torch einsum + s.topk chain. Off = the torch path, unchanged.
     SGLANG_OPT_PPU_DSV41_PREFILL_INDEXER_NATIVE = EnvBool(False)
+    # PPU DSV4.1 native FP8 sparse prefill attention (DSV41-S5.1 port): layers
+    # 2-35 of the sparse prefill dispatch to FlashMLA's quantized sparse kernel
+    # (bf16 Q quantized in-kernel, KV workspace in E4M3, FP8 tensor-core QK/PV)
+    # instead of the bf16 sparse kernel. Requires a wheel exporting
+    # flash_mla_sparse_quantized_fwd; unsupported shapes (head count, d_qk,
+    # topk width) and old wheels silently keep the bf16 path. Off = the bf16
+    # path, unchanged.
+    SGLANG_OPT_PPU_DSV4_NATIVE_FP8_PREFILL = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
