@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -565,6 +566,15 @@ def run_ppu_mega_routed_experts(
         intermediate=intermediate_size,
     )
 
+    # First-call shape/dtype audit: the same call runs clean outside sglang,
+    # so a fault here means the staged inputs differ from that reference.
+    if os.environ.get("SGLANG_PPU_MEGA_MOE_AUDIT") == "1" and not _PPU_MEGA_MOE_AUDITED:
+        _audit_ppu_mega_moe_inputs(
+            hidden_states, topk_ids_in, topk_weights_in, buf,
+            num_tokens=num_tokens, experts=experts, top_k=top_k,
+        )
+        globals()["_PPU_MEGA_MOE_AUDITED"] = True
+
     deep_gemm.mega_moe_pre_dispatch(
         hidden_states,
         topk_ids_in,
@@ -594,6 +604,33 @@ def run_ppu_mega_routed_experts(
 
 
 _PPU_MEGA_MOE_TRACED = False
+
+
+_PPU_MEGA_MOE_AUDITED = False
+
+
+def _audit_ppu_mega_moe_inputs(
+    hidden_states, topk_ids, topk_weights, buf, *, num_tokens, experts, top_k
+) -> None:
+    """Report the staged inputs once, to compare against the standalone repro."""
+    local_experts = int(getattr(experts, "mega_l1_weights", [None, None])[0].shape[0])
+    valid = topk_ids[topk_ids >= 0] if topk_ids.numel() else topk_ids
+    over = int((valid >= local_experts).sum().item()) if valid.numel() else 0
+    dup_rows = 0
+    if topk_ids.numel():
+        row = topk_ids[:num_tokens].tolist()
+        dup_rows = sum(1 for r in row if len(set(r)) != len(r))
+    logger.info(
+        "[TH-S13][mega-moe][audit] num_tokens=%s hs.shape=%s hs.contig=%s hs.dtype=%s "
+        "ids.shape=%s ids.dtype=%s ids.min=%s ids.max=%s out_of_range=%s dup_rows=%s "
+        "w.shape=%s w.dtype=%s local_experts=%s top_k=%s",
+        num_tokens, tuple(hidden_states.shape), hidden_states.is_contiguous(),
+        hidden_states.dtype, tuple(topk_ids.shape), topk_ids.dtype,
+        int(valid.min().item()) if valid.numel() else None,
+        int(valid.max().item()) if valid.numel() else None,
+        over, dup_rows, tuple(topk_weights.shape), topk_weights.dtype,
+        local_experts, top_k,
+    )
 
 
 def _trace_ppu_mega_moe_call(
