@@ -96,7 +96,7 @@ def _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank: int) -> None:
     )
 
 
-def _is_mnnvl_fabric_supported() -> bool:
+def _is_mnnvl_fabric_supported(group_size: int = 0) -> bool:
     # On PPU this whole function is replaced by a REPLACE plugin hook
     # (hardware_backend/ppu/moe/ppu_deepep_hooks.py), so anything added here is
     # dead code there.
@@ -317,7 +317,9 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
-        use_mnnvl_fabric = _is_mnnvl_fabric_supported()
+        use_mnnvl_fabric = _is_mnnvl_fabric_supported(
+            group_size=self.group.size()
+        )
         buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,

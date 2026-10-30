@@ -19,5 +19,14 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
     "sglang.srt.layers.moe.token_dispatcher.deepep._is_mnnvl_fabric_supported",
     type=HookType.REPLACE,
 )
-def _ppu_is_mnnvl_fabric_supported() -> bool:
-    return envs.SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED.get()
+def _ppu_is_mnnvl_fabric_supported(group_size: int = 0) -> bool:
+    # Respect an explicit env override first.
+    if envs.SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED.is_set():
+        return envs.SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED.get()
+    # On PPU, cross-machine EP groups (group_size > device_count) require the
+    # ICN/IMEX fabric; single-machine EP keeps P2P.
+    if group_size <= 0:
+        return True
+    import torch  # local import to avoid a top-level torch dep at plugin load
+
+    return group_size > torch.cuda.device_count()
