@@ -3956,8 +3956,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _evict_swa(self, req: Req, pre_len: int, *, eviction_interval: int = 1):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
+        # Decode-step trim: keep one window above the frontier so the finish
+        # insert (or the next chunk's insert) can capture it as tree SWA
+        # instead of finding the ring already freed (TH-S6, DSV41-S5.13 port:
+        # first-touch rescue; the kept range is released by the next trim if
+        # no insert captures it, so the ring never grows beyond one window).
         self.tree_cache.evict_sliding_windows(
-            req, pre_len, eviction_interval=eviction_interval
+            req,
+            pre_len,
+            eviction_interval=eviction_interval,
+            defer_last_window=True,
         )
 
     def __str__(self):

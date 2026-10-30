@@ -65,6 +65,7 @@ def free_swa_out_of_window_slots(
     component_type: ComponentType = ComponentType.SWA,
     free_segment: Callable[..., None] | None = None,
     eviction_interval: int = 1,
+    defer_last_window: bool = False,
 ) -> None:
     if not req.kv.holds_kv:
         return
@@ -107,14 +108,31 @@ def free_swa_out_of_window_slots(
         new_evicted_seqlen = (new_evicted_seqlen // page_size) * page_size
 
     if new_evicted_seqlen > evicted_seqlen:
+        # TH-S6 (DSV41-S5.13 port): the pre-insert trim (cache_unfinished_req)
+        # and the decode-step trim keep one window above the eviction frontier
+        # alive so the radix insert that follows can capture it as tree-owned
+        # SWA (and the write-through then hosts it via #34565's dirty-window
+        # backup). Without this, the chunk-boundary trim frees the body's SWA
+        # while it is still only in the request ring, and the first request
+        # matching at a mid-prefix page boundary lands in the tombstone region
+        # (first-touch full recompute). The kept range is released by the next
+        # trim once the tree has captured it (the insert raises
+        # cache_protected_len, so the retain floor protects it), so nothing
+        # leaks either way.
+        free_end = new_evicted_seqlen
+        if defer_last_window and not is_chunk_cache:
+            keep_from = new_evicted_seqlen - max(sliding_window_size, page_size)
+            if page_size > 1:
+                keep_from = (keep_from // page_size) * page_size
+            free_end = max(evicted_seqlen, keep_from)
         free_slots = req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, evicted_seqlen:new_evicted_seqlen
+            req.kv.req_pool_idx, evicted_seqlen:free_end
         ]
         if free_segment is None:
             assert component_type == ComponentType.SWA
             free_segment = token_to_kv_pool_allocator.free_swa_segment
         free_segment(free_slots, start_pos=evicted_seqlen)
-        req.kv.set_evicted_seqlen(component_type, new_evicted_seqlen)
+        req.kv.set_evicted_seqlen(component_type, free_end)
 
 
 def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
