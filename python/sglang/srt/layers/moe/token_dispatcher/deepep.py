@@ -318,7 +318,7 @@ class DeepEPBuffer:
                 )
 
         use_mnnvl_fabric = _is_mnnvl_fabric_supported(
-            group_size=self.group.size()
+            group_size=group.size()
         )
         buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
