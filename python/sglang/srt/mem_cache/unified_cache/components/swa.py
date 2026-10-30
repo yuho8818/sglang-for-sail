@@ -974,7 +974,9 @@ class SWAComponent(TreeComponent):
         insert_params.swa_branching_seqlen = branching_seqlen
         return effective_cache_len
 
-    def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
+    def _free_out_of_window_slots(
+        self, req: Req, pre_len: int, defer_last_window: bool = False
+    ) -> None:
         if self.sliding_window_size is None:
             return
         free_swa_out_of_window_slots(
@@ -985,12 +987,15 @@ class SWAComponent(TreeComponent):
             req_to_token_pool=self.cache.req_to_token_pool,
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
             retain_floor=self.cache.swa_retain_floor(req),
+            defer_last_window=defer_last_window,
         )
 
     def free_out_of_window_slots(
         self, req: Req, pre_len: int, insert_params: InsertParams
     ) -> None:
-        self._free_out_of_window_slots(req, pre_len)
+        # Pre-insert trim (cache_unfinished_req): keep the last window above
+        # the frontier for the insert to capture (TH-S6, DSV41-S5.13 port).
+        self._free_out_of_window_slots(req, pre_len, defer_last_window=True)
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )
