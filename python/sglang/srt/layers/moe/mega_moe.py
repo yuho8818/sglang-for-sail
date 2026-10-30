@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -24,6 +25,8 @@ import torch
 from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+
+logger = logging.getLogger(__name__)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_moe_sm90 import (
@@ -540,8 +543,13 @@ def run_ppu_mega_routed_experts(
     # slots (-1) may repeat. The router already emits that shape, so this only
     # fixes the dtype/layout the kernel demands.
     if num_tokens > 0:
-        topk_ids_in = topk_ids.to(torch.int64).contiguous()
-        topk_weights_in = topk_weights.to(torch.float32).contiguous()
+        # The complete call reads x/x_sf/topk_idx/topk_weights from the buffer
+        # prefix, and the decode graph hands these in from static buffers whose
+        # tail rows hold whatever the last batch left there. Slice to this
+        # rank's rows first so the staged prefix is exactly the live tokens.
+        topk_ids_in = topk_ids[:num_tokens].to(torch.int64).contiguous()
+        topk_weights_in = topk_weights[:num_tokens].to(torch.float32).contiguous()
+        hidden_states = hidden_states[:num_tokens].contiguous()
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int64)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
@@ -606,6 +614,7 @@ def _trace_ppu_mega_moe_call(
     from sglang.srt.utils.common import log_info_on_rank0
 
     log_info_on_rank0(
+        logger,
         f"[TH-S13][mega-moe] PPU W4A4 MegaMoE engaged: fp4_fp4_mega_moe rank={rank} "
         f"num_tokens={num_tokens} experts={num_experts} top_k={top_k} "
         f"hidden={hidden} intermediate={intermediate}"
@@ -729,11 +738,23 @@ def _data(t):
     return getattr(t, "data", t) if torch.is_tensor(t) else None
 
 
+def _first_attr(obj, *names):
+    """The first of ``names`` set on ``obj``, or None."""
+    for name in names:
+        value = getattr(obj, name, None)
+        if value is not None:
+            return value
+    return None
+
+
 def _as_uint8(t):
     """Reinterpret a packed nibble/byte tensor as raw uint8, the only spelling
     ``transform_weights_for_mega_moe`` accepts. Both MXFP4 e2m1 weights and
-    UE8M0 scales carry the same bits whichever view the loader left them in."""
-    return _data(t).view(torch.uint8).contiguous()
+    UE8M0 scales carry the same bits whichever view the loader left them in.
+
+    Contiguity has to be established before the view: a uint16 view of a
+    strided scale tensor cannot be re-viewed as bytes in place."""
+    return _data(t).contiguous().view(torch.uint8)
 
 
 def build_ppu_mega_moe_experts_weights(experts) -> None:
@@ -754,12 +775,9 @@ def build_ppu_mega_moe_experts_weights(experts) -> None:
 
     w13 = getattr(experts, "w13_weight", None)
     w2 = getattr(experts, "w2_weight", None)
-    w13_sf = getattr(experts, "w13_weight_scale", None) or getattr(
-        experts, "w13_weight_scale_inv", None
-    )
-    w2_sf = getattr(experts, "w2_weight_scale", None) or getattr(
-        experts, "w2_weight_scale_inv", None
-    )
+    # Attribute fallback, not truthiness: a tensor's `or` raises.
+    w13_sf = _first_attr(experts, "w13_weight_scale", "w13_weight_scale_inv")
+    w2_sf = _first_attr(experts, "w2_weight_scale", "w2_weight_scale_inv")
     if not all(torch.is_tensor(t) for t in (w13, w2, w13_sf, w2_sf)):
         raise ValueError(
             "PPU MegaMoE needs packed MXFP4 experts (e2m1 weights + UE8M0 "
