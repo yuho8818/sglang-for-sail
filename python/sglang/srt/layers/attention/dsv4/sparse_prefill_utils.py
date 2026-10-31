@@ -87,6 +87,7 @@ class SparsePrefillWorkspace:
     def __init__(self, device: torch.device):
         self.device = device
         self._buffer: Optional[torch.Tensor] = None
+        self._bf16_buffer: Optional[torch.Tensor] = None
 
     def get(
         self,
@@ -103,6 +104,23 @@ class SparsePrefillWorkspace:
                 device=self.device,
             )
         return self._buffer[:num_tokens]
+
+    def get_bf16(self, num_tokens: int) -> torch.Tensor:
+        """bf16 scratch, separate from the (possibly e4m3) main buffer.
+
+        The native FP8 prefill path needs somewhere for the paged gather to
+        write before quantising into the e4m3 workspace. The two buffers must
+        not alias: the copy reads one while writing the other.
+        """
+        assert num_tokens > 0
+        capacity = self._bf16_buffer.shape[0] if self._bf16_buffer is not None else 0
+        if num_tokens > capacity:
+            self._bf16_buffer = torch.empty(
+                (num_tokens, 1, WORKSPACE_DIM),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+        return self._bf16_buffer[:num_tokens]
 
 
 def combined_topk_width(topk: int, window_size: int) -> int:

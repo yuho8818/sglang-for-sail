@@ -3789,21 +3789,39 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if compressed_slice is not None:
+        # `dequantize_k_cache_paged` writes bf16 unconditionally (it asserts on
+        # `out.dtype`), but the native FP8 kernel wants an e4m3 workspace. So the
+        # gather lands in a bf16 staging buffer and the e4m3 copy is one extra
+        # pass over the same rows; quantising inside the dequant kernel would
+        # mean editing a kernel that the bf16 path also uses.
+        if native_fp8:
+            # `workspace` is already sized exactly to this layer's rows
+            # (compressed + SWA, or SWA only when compress_ratio == 0).
+            staging = self.sparse_prefill_workspace.get_bf16(workspace.shape[0])
+            split = 0 if compressed_slice is None else compressed_slice.shape[0]
+            compressed_out = staging[:split] if split else None
+            swa_out = staging[split:]
+        else:
+            staging = None
+            compressed_out, swa_out = compressed_slice, swa_slice
+
+        if compressed_out is not None:
             dequantize_k_cache_paged(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
-                out=compressed_slice,
+                out=compressed_out,
                 layout=token_to_kv_pool.get_extra_key_layout(layer_id),
             )
         dequantize_k_cache_paged(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
-            out=swa_slice,
+            out=swa_out,
             layout=token_to_kv_pool.get_swa_key_layout(),
         )
+        if staging is not None:
+            workspace.copy_(staging)
         kv = workspace
 
         o, _, _ = (native_fn or flash_mla_sparse_fwd)(
