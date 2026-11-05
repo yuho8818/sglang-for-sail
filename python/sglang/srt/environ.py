@@ -1329,6 +1329,13 @@ class Envs:
     )
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    # Canonical (index-ascending) emission for the JIT dsv4 topk_v2 kernel.
+    # The default staging is warp-arrival ordered, so the same selected set can
+    # be emitted in a different permutation on every run; the downstream sparse
+    # attention sum makes the permutation visible in the logits. Compile-time
+    # flag: resolved when the JIT module is first built, needs a process
+    # restart to change. Set to 0 to restore the warp-arrival emission order.
+    SGLANG_TOPK_V2_DETERMINISTIC_EMIT = EnvBool(True)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )
