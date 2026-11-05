@@ -39,13 +39,30 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
     if not (
         (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
         or platform.is_hip
+        or _ppu_w4a4_mega_moe_enabled(platform)
     ):
         raise ValueError(
             "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
             "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
             "kernels over CUDA symmetric memory. On ROCm, set "
-            "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."
+            "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead. "
+            "On PPU1.5, set SGLANG_OPT_PPU_DSV41_MEGAMOE=1 to select the W4A4 "
+            "DeepGEMM pipeline."
         )
+
+
+def _ppu_w4a4_mega_moe_enabled(platform=None) -> bool:
+    """PPU1.5 serves MegaMoE through DeepGEMM's complete W4A4 call.
+
+    PPU reports compute capability 8.9, so the SM90 / SM100 gates above never
+    match; the switch is an explicit opt-in because the PPU kernel set only
+    covers MXFP4 experts with no shared experts and top-k <= 16.
+    """
+    if not envs.SGLANG_OPT_PPU_DSV41_MEGAMOE.get():
+        return False
+    from sglang.srt.utils import is_ppu
+
+    return bool(is_ppu())
 
 
 # MoE blocks with no fused-MoE fallback under megamoe.
