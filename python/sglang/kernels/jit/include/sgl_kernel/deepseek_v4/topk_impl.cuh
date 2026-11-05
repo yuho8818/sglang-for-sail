@@ -187,6 +187,16 @@ struct TopKProblem {
 // Shared configuration + tie handling (exact radix select on the threshold bin)
 // ---------------------------------------------------------------------------
 
+// Deterministic emission order. The selection stages candidates with
+// warp-arrival atomics, so the same selected set can be emitted in different
+// permutations on different runs; downstream sparse attention sums in
+// emission order, so the permutation is observable in the output logits. When
+// this is 1, the one-block paths stage the selection and emit it in a
+// canonical (index-ascending) order instead.
+#if !defined(SGL_TOPK_DETERMINISTIC_EMIT)
+#define SGL_TOPK_DETERMINISTIC_EMIT 1
+#endif
+
 struct TopKConfig {
   static constexpr uint32_t kMaxTopK = 2048;
   static constexpr uint32_t kBlockSize = 1024;
@@ -218,16 +228,48 @@ struct TopKConfig {
     uint32_t histogram[2][kRadixSize];
   };
 
+  /// Canonical ordering for deterministic emission: bitonic sort of the first
+  /// `n` entries of `stage` (uint32 indices), ascending. Entries in
+  /// [n, next_pow2(n)) are treated as +inf and sort to the tail. kBlockSize
+  /// threads participate; the helper syncs once before comparing, which also
+  /// publishes the caller's staging writes.
+  SGL_DEVICE static void sort_stage_ascending(uint32_t* __restrict__ stage, const uint32_t n) {
+    const auto tx = threadIdx.x;
+    if (n <= 1) return;
+    const uint32_t p2 = 1u << (32 - __clz(n - 1));
+    for (uint32_t t = n + tx; t < p2; t += kBlockSize) stage[t] = 0xFFFFFFFFu;
+    __syncthreads();
+    for (uint32_t k = 2; k <= p2; k <<= 1) {
+      for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+        for (uint32_t i = tx; i < p2; i += kBlockSize) {
+          const uint32_t l = i ^ j;
+          if (l > i) {
+            const bool up = (i & k) == 0;
+            const uint32_t ai = stage[i];
+            const uint32_t al = stage[l];
+            if (up == (ai > al)) {
+              stage[i] = al;
+              stage[l] = ai;
+            }
+          }
+        }
+        __syncthreads();
+      }
+    }
+  }
+
   /// Resolve the threshold bin's ties exactly. `base` is the number of strictly
   /// "above" elements already emitted (final output starts at slot `base`);
   /// `topk` here is the number of remaining slots to fill (== global_topk - base).
+  /// `stage` (optional) is a kMaxTopK-entry scratch for canonical emission.
   SGL_DEVICE static void handle_tie(  //
       const TieValue* tie_buffer,
       const TopKProblem& problem,
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
-      TieHandleSmem* smem) {
+      TieHandleSmem* smem,
+      uint32_t* stage = nullptr) {
     constexpr auto is_greater = [](const TieValue& a, const TieValue& b) {
       return (a.value > b.value) || (a.value == b.value && a.idx < b.idx);
     };
@@ -300,11 +342,11 @@ struct TopKConfig {
       }
     } else if (num_ties <= kBlockSize) {
       // Common case: one candidate per thread.
-      return radix_tie_select<1>(tie_buffer, problem, base, num_ties, topk, smem);
+      return radix_tie_select<1>(tie_buffer, problem, base, num_ties, topk, smem, stage);
     } else {
       // Rare overflow case.
       static_assert(kTieItems == 2);
-      return radix_tie_select<2>(tie_buffer, problem, base, num_ties, topk, smem);
+      return radix_tie_select<2>(tie_buffer, problem, base, num_ties, topk, smem, stage);
     }
   }
 
@@ -318,7 +360,8 @@ struct TopKConfig {
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
-      TieHandleSmem* smem) {
+      TieHandleSmem* smem,
+      uint32_t* stage = nullptr) {
     const auto tx = threadIdx.x;
     const auto lane_id = tx % kWarpSize;
     const auto warp_id = broadcast(tx / kWarpSize);
@@ -399,6 +442,24 @@ struct TopKConfig {
       if (round == 3 || topk_remain == 0) break;
     }
 
+#if SGL_TOPK_DETERMINISTIC_EMIT
+    if (stage != nullptr) {
+      // write_pos came from warp-arrival atomics, so the same selection can be
+      // emitted in a different permutation on every run. Stage by write_pos,
+      // order the segment canonically, then emit.
+      for (uint32_t t = tx; t < topk; t += kBlockSize) stage[t] = 0xFFFFFFFFu;
+      __syncthreads();
+#pragma unroll
+      for (uint32_t i = 0; i < kItems; ++i) {
+        if (write_pos[i] < topk) stage[write_pos[i]] = idx[i];
+      }
+      sort_stage_ascending(stage, topk);
+      for (uint32_t t = tx; t < topk; t += kBlockSize) {
+        if (stage[t] != 0xFFFFFFFFu) problem.emit(base + t, stage[t]);
+      }
+      return;
+    }
+#endif
 #pragma unroll
     for (uint32_t i = 0; i < kItems; ++i) {
       if (write_pos[i] < topk) problem.emit(base + write_pos[i], idx[i]);
@@ -435,6 +496,13 @@ struct TopKRadixBase : TopKConfig {
         TieHandleSmem tie_handle;
       };
     };
+#if SGL_TOPK_DETERMINISTIC_EMIT
+    // Staging for canonical emission: the selection is gathered here (in
+    // warp-arrival order), sorted ascending, and only then emitted, so the
+    // output permutation is a fixed function of the selected set. Live only
+    // after find_threshold, alongside the tie overlay above.
+    uint32_t stage_idxs[kMaxTopK];
+#endif
   };
 
  protected:
@@ -610,9 +678,15 @@ struct TopKRegister : TopKRadixBase<12> {
         const auto val = local_vecs[i][j];
         if (val >= v_hi) {
           const auto pos = atomicAdd(&smem->count_gt, 1);
+#if SGL_TOPK_DETERMINISTIC_EMIT
+          if (pos < kMaxTopK) [[likely]] {
+            smem->stage_idxs[pos] = idx;
+          }
+#else
           if (pos < topk) [[likely]] {
             problem.emit(pos, idx);
           }
+#endif
         } else if (val >= v_lo) {
           const auto pos = atomicAdd(&smem->count_eq, 1);
           if (pos < kMaxNumTie) [[likely]] {
@@ -624,11 +698,25 @@ struct TopKRegister : TopKRadixBase<12> {
 
     // Phase 4: Handle ties.
     __syncthreads();
+#if SGL_TOPK_DETERMINISTIC_EMIT
+    // Emit the staged "above" selection in canonical (index-ascending) order.
+    {
+      const auto n_above = min(min(smem->count_gt, topk), kMaxTopK);
+      sort_stage_ascending(smem->stage_idxs, n_above);
+      for (uint32_t t = tx; t < n_above; t += kBlockSize) {
+        problem.emit(t, smem->stage_idxs[t]);
+      }
+    }
+#endif
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
     const auto tie_count = min(count_eq, kMaxNumTie);
+#if SGL_TOPK_DETERMINISTIC_EMIT
+    handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle, smem->stage_idxs);
+#else
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
+#endif
   }
 };
 
@@ -684,9 +772,15 @@ struct TopKStreaming : TopKRadixBase<12> {
     for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
+#if SGL_TOPK_DETERMINISTIC_EMIT
+        if (pos < kMaxTopK) [[likely]] {
+          smem->stage_idxs[pos] = idx;
+        }
+#else
         if (pos < topk) [[likely]] {
           problem.emit(pos, idx);
         }
+#endif
       } else if (val >= v_lo) {
         const auto pos = atomicAdd(&smem->count_eq, 1);
         if (pos < kMaxNumTie) [[likely]] {
@@ -701,11 +795,25 @@ struct TopKStreaming : TopKRadixBase<12> {
     // "above" and "tie" sets. above_count is < topk by the threshold-bin invariant,
     // so the count_gt guard above effectively never triggers.
     __syncthreads();
+#if SGL_TOPK_DETERMINISTIC_EMIT
+    // Emit the staged "above" selection in canonical (index-ascending) order.
+    {
+      const auto n_above = min(min(smem->count_gt, topk), kMaxTopK);
+      sort_stage_ascending(smem->stage_idxs, n_above);
+      for (uint32_t t = tx; t < n_above; t += kBlockSize) {
+        problem.emit(t, smem->stage_idxs[t]);
+      }
+    }
+#endif
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
     const auto tie_count = min(count_eq, kMaxNumTie);
+#if SGL_TOPK_DETERMINISTIC_EMIT
+    handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle, smem->stage_idxs);
+#else
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
+#endif
   }
 };
 
