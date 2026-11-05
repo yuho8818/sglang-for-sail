@@ -307,6 +307,15 @@ class ReqToTokenPool:
                 (self._alloc_size, max_context_len), dtype=torch.int32, device=device
             )
         self.free_slots = list(range(1, self._alloc_size))
+        # Row 0 is the reserved read source for idle / zero-padded rows (they
+        # carry req_pool_indices=0). Point it at cache location 1 instead of
+        # location 0: padded rows WRITE their dummy KV to location 0
+        # (out_cache_loc=0), so location 0's content evolves across decode
+        # steps and leaks the previous request's state into the next one's
+        # padding rows. Location 1 sits in the same reserved (never-allocated)
+        # region and is never written to, so the padding rows read a fixed
+        # value instead of the previous batch's leftover KV.
+        self.req_to_token[0].fill_(1)
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
 
