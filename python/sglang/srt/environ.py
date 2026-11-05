@@ -1329,6 +1329,15 @@ class Envs:
     # flag: resolved when the JIT module is first built, needs a process
     # restart to change. Set to 0 to restore the warp-arrival emission order.
     SGLANG_TOPK_V2_DETERMINISTIC_EMIT = EnvBool(True)
+    # Pad decode batches by replicating row 0 into the dummy rows instead of
+    # zeroes. The zero-padded rows carry req_pool_indices=0 and
+    # out_cache_loc=0, so their attention reads request slot 0's stale state
+    # and their KV writes land on cache location 0: run-to-run noise that
+    # reaches real rows through batch-spanning ops. Replicas make the dummy
+    # rows an idempotent copy of row 0, so decode becomes a fixed function of
+    # the real batch. Only DECODE batches (verify keeps its spec-block
+    # padding; idle rows are masked downstream).
+    SGLANG_DECODE_PAD_CLONE_FIRST_ROW = EnvBool(True)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )
