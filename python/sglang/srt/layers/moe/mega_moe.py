@@ -243,7 +243,20 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank <= cap:
+        return True
+    if _use_ppu_mega_moe() and envs.SGLANG_OPT_PPU_DSV41_MEGAMOE_EXCLUSIVE.get():
+        # Exclusive mode freed the grouped-path weights, so falling back
+        # would AttributeError deep inside the grouped GEMM. Fail with the
+        # knob that resolves it instead.
+        raise ValueError(
+            f"PPU MegaMoE exclusive mode freed the grouped-path weights, but "
+            f"this forward needs {max_tokens_per_rank} tokens/rank, over the "
+            f"cap of {cap}. Lower --chunked-prefill-size (per CP rank), raise "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK, or unset "
+            "SGLANG_OPT_PPU_DSV41_MEGAMOE_EXCLUSIVE."
+        )
+    return False
 
 
 def forward_mega_moe(
@@ -766,6 +779,13 @@ def build_ppu_mega_moe_experts_weights(experts) -> None:
     ``w13_weight`` used by the grouped paths; the packed pairs get their own
     parameters, so unloading the checkpoint tensors frees the originals before
     the next layer converts.
+
+    With ``SGLANG_OPT_PPU_DSV41_MEGAMOE_EXCLUSIVE=1`` the grouped-path
+    tensors are freed instead once the packed pair exists, reclaiming the
+    duplicated routed-expert weights (~23 GB/GPU on DSV4.1-Flash MXFP4).
+    The grouped-GEMM fallback then has no weights;
+    ``should_use_mega_moe`` raises on token-cap overflow instead of
+    falling back.
     """
     if getattr(experts, "ppu_mega_moe_weights_built", False):
         return
@@ -805,3 +825,28 @@ def build_ppu_mega_moe_experts_weights(experts) -> None:
 
     experts.ppu_mega_moe_weights_built = True
     experts._mega_moe_weights_built = True
+
+    if envs.SGLANG_OPT_PPU_DSV41_MEGAMOE_EXCLUSIVE.get():
+        _release_ppu_grouped_path_weights(experts)
+
+
+def _release_ppu_grouped_path_weights(experts) -> None:
+    """Exclusive mode: free the checkpoint-layout tensors the packed pair replaces.
+
+    The packed ``mega_l2_weights[0]`` shares storage with ``w2_weight`` (the
+    transform returns that tensor unchanged), so only the w13 pair and the
+    raw scales are true duplicates; free those. ``w2_weight`` itself stays:
+    deleting the attribute saves nothing and only removes a shared-storage
+    reference. After this the grouped-GEMM fallback has no weights, which is
+    why ``should_use_mega_moe`` must raise (never fall back) in this mode.
+    """
+    for attr in (
+        "w13_weight",
+        "w13_weight_scale",
+        "w13_weight_scale_inv",
+        "w2_weight_scale",
+        "w2_weight_scale_inv",
+    ):
+        if hasattr(experts, attr):
+            delattr(experts, attr)
+    torch.cuda.empty_cache()
