@@ -1315,6 +1315,24 @@ class Envs:
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+    # PPU W4A4 MegaMoE. When on, `--moe-a2a-backend megamoe` is accepted on
+    # PPU1.5 and routed experts go through DeepGEMM's complete W4A4 call
+    # (`fp4_fp4_mega_moe`): one cross-rank kernel covers dispatch, GEMM1 +
+    # GLU + requantization, GEMM2 and combine. Off leaves the backend
+    # rejected on PPU, so the default grouped-GEMM path and its numerics are
+    # untouched.
+    SGLANG_OPT_PPU_DSV41_MEGAMOE = EnvBool(False)
+    # PPU W4A4 MegaMoE exclusive mode. When on, the checkpoint-layout w13
+    # pair and the raw scales are freed right after the packed MegaMoE pair
+    # is built, reclaiming the duplicated routed-expert weights (~23 GB/GPU
+    # on DSV4.1-Flash MXFP4). The grouped-GEMM fallback then has no weights,
+    # so should_use_mega_moe() raises on token-cap overflow instead of
+    # falling back. Only valid while every forward stays under
+    # SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK: with prefill CP
+    # that means chunked_prefill_size / attn_cp_size <= cap (checked at
+    # startup). Weight swapping (EPLB rebalance, expert distribution
+    # recording, hot reload) is unsupported in this mode.
+    SGLANG_OPT_PPU_DSV41_MEGAMOE_EXCLUSIVE = EnvBool(False)
 
     # DSA Backend (canonical names; fall back to SGLANG_NSA_* with deprecation warning)
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(

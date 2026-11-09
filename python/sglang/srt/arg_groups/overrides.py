@@ -1657,6 +1657,30 @@ def _a2a_backend_overrides(view: Any) -> dict:
             "MegaMoE is not supported on PPU; use --moe-a2a-backend none, or set "
             "SGLANG_OPT_PPU_DSV41_MEGAMOE=1 to select the W4A4 DeepGEMM pipeline."
         )
+    if (
+        is_ppu()
+        and moe_a2a_backend == "megamoe"
+        and envs.SGLANG_OPT_PPU_DSV41_MEGAMOE_EXCLUSIVE.get()
+    ):
+        # Exclusive mode frees the grouped-path weights, so every forward
+        # must stay under the MegaMoE token cap; refuse at startup instead
+        # of failing mid-benchmark. chunked_prefill_size can still be
+        # unresolved here (None); the runtime guard in should_use_mega_moe
+        # remains the backstop in that case.
+        cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        chunked = view.chunked_prefill_size
+        cp = (view.attn_cp_size or 1) if view.enable_prefill_cp else 1
+        per_rank = chunked // cp if chunked else None
+        if per_rank is not None and per_rank > cap:
+            raise ValueError(
+                f"SGLANG_OPT_PPU_DSV41_MEGAMOE_EXCLUSIVE=1 requires every "
+                f"forward to stay under the MegaMoE token cap ({cap}/rank), "
+                f"but chunked prefill resolves to {per_rank} tokens/rank "
+                f"(chunked_prefill_size={chunked}, per-rank divisor={cp}). "
+                "Lower --chunked-prefill-size, raise "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK, or "
+                "unset SGLANG_OPT_PPU_DSV41_MEGAMOE_EXCLUSIVE."
+            )
     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(
             "moe_a2a_backend is overridden to 'deepep' because Waterfill "
