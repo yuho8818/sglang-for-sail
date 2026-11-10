@@ -1908,6 +1908,15 @@ class Envs:
     # first built, so changing it needs a process restart. Set to 0 to restore
     # the arrival-order emission.
     SGLANG_TOPK_V2_DETERMINISTIC_EMIT = EnvBool(True)
+    # Pad decode batches by replicating row 0 into the dummy rows instead of
+    # zero/fill. The zero-padded rows carry req_pool_indices=0 and
+    # out_cache_loc=0, so their attention reads request slot 0's stale state and
+    # their KV writes land on cache location 0: run-to-run noise that reaches
+    # real rows through batch-spanning ops. Replicas instead make the dummy rows
+    # an idempotent copy of row 0, so a decode step becomes a fixed function of
+    # the real batch. Only DECODE batches: TARGET_VERIFY pads inside the spec
+    # block with its own semantics, and idle rows are fully masked downstream.
+    SGLANG_DECODE_PAD_CLONE_FIRST_ROW = EnvBool(True)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
