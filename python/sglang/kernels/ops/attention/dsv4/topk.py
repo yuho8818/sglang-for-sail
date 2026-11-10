@@ -41,7 +41,15 @@ def _jit_topk_v2_module():
 
     args = make_cpp_args(is_arch_support_pdl())
     # Enable each cluster path only when its occupancy probe reports capacity.
-    extra_cuda_cflags = []
+    extra_cuda_cflags = [
+        # Canonical (ascending-index) emission order. The select implementations
+        # hand out output slots with warp-arrival atomics, so the same selected
+        # set is emitted in a different permutation on every run, and the
+        # downstream sparse attention sum makes that visible in the logits.
+        # Compile-time flag; see SGLANG_TOPK_V2_DETERMINISTIC_EMIT.
+        "-DSGL_TOPK_V2_DETERMINISTIC_EMIT="
+        + ("1" if envs.SGLANG_TOPK_V2_DETERMINISTIC_EMIT.get() else "0")
+    ]
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
         for cluster_size, occupancy in ((8, 2), (16, 1)):
             try:

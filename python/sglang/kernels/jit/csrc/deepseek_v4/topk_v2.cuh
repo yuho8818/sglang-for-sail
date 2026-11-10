@@ -51,6 +51,124 @@ constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 
 #define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
 
+// ---------------------------------------------------------------------------
+// Deterministic (canonical) emission order
+// ---------------------------------------------------------------------------
+//
+// `TopKRegister` / `TopKStreaming` / `radix_tie_select` assign their output
+// slots with `atomicAdd` on a shared counter, i.e. in warp-arrival order. The
+// selected *set* is reproducible (the histogram, the threshold bin and the
+// value-then-index tie comparator are all order-independent), but the
+// *permutation* it is emitted in is not: the same set lands in different slots
+// on different runs. Downstream sparse attention accumulates its KV
+// contributions in emission order, so that permutation changes the fp32
+// summation order and is observable in the logits -- identical greedy requests
+// (temperature=0) decode differently run to run.
+//
+// Every path here funnels through the same sink: the kernel points
+// `problem.out` at `s_topk_indices` (shared memory staging), lets the select
+// implementation write it in arrival order, and then calls `paged_transform`.
+// Ordering that one buffer between the two steps therefore canonicalizes all of
+// them at once, and the ordering lives in this file rather than in the shared
+// implementation classes.
+//
+// What "canonical" buys is that the permutation becomes a function of the
+// selected set alone -- not that the row's final output comes out sorted. The
+// sort runs on the *raw* selected positions, and `paged_transform` then maps
+// them through the page table, which is not monotone unless the table is; the
+// emitted page slots are therefore in page-table order, not ascending order.
+// That is all determinism needs: a fixed total order on the selected set.
+//
+// The buffer holds exactly `topk` entries and only the slots the arrival-order
+// atomics actually claimed are meaningful; the rest is leftover from the
+// previous row or from a previous kernel. Slots past the selection are written
+// as -1 below, which as an unsigned value is UINT32_MAX and therefore sorts to
+// the tail under the ascending comparison used here. That matches what the
+// existing padding does anyway (`trivial_transform` writes -1 into the unused
+// slots, and `paged_transform` maps every negative entry to -1), and the tail
+// is never dereferenced by the consumer, which only reads min(seq_len, topk)
+// entries.
+//
+// Compile-time gate: `SGL_TOPK_V2_DETERMINISTIC_EMIT` is injected by the JIT
+// loader from `SGLANG_TOPK_V2_DETERMINISTIC_EMIT` (default on). It is resolved
+// when the module is first built, so changing it needs a process restart; 0
+// restores the arrival-order emission.
+#if !defined(SGL_TOPK_V2_DETERMINISTIC_EMIT)
+#define SGL_TOPK_V2_DETERMINISTIC_EMIT 1
+#endif
+//
+// Scope: this canonicalizes every path that stages its selection into a
+// per-row shared-memory buffer, which is all of them on the accelerator this
+// ships to (see the note on the dispatch below). Two arrival-order paths are
+// deliberately left alone because they have no single staging buffer to sort:
+//
+//   - the cluster path (`SUPPORT_CLUSTER`, sm90/sm100 CUDA), where the exact
+//     select runs in `TopKCluster` across ranks and emits straight into the
+//     row's output, and `topk_main_kernel`'s level-3 epilogue then transforms
+//     that row in place;
+//   - ROCm's split path (`TopKSplit::select_chunk`), where each rank appends
+//     into the row's output at an offset from a shared counter.
+//
+// Neither is compiled for this deployment (`SUPPORT_CLUSTER` requires
+// `SGL_CUDA_ARCH` in [900, 1100) and `USE_ROCM` is set only for HIP), so the
+// guarantee holds where it is claimed. Making the flag hold on those two as
+// well needs a whole-row staging buffer plus a gather across ranks, which is a
+// separate change.
+
+/// Block-wide bitonic sort of `stage[0, n)` ascending, unsigned. `kBlockSize`
+/// threads participate. `n` is rounded up to a power of two internally, and the
+/// `[n, p2)` entries the network compares are filled with -1 so they sort past
+/// the live entries instead of interleaving with them; the caller must already
+/// have done the same for `[live, n)`, which is what makes the padding a single
+/// contiguous tail. Syncs once per network layer, so the staging writes that
+/// precede the first layer must be published by a `__syncthreads()` in the
+/// caller.
+SGL_DEVICE void sort_topk_output_ascending(uint32_t* __restrict__ stage, const uint32_t n) {
+  const auto tx = threadIdx.x;
+  if (n <= 1) return;
+  const uint32_t p2 = 1u << (32 - __clz(n - 1));
+  for (uint32_t t = n + tx; t < p2; t += kBlockSize) stage[t] = 0xFFFFFFFFu;
+  __syncthreads();
+  for (uint32_t k = 2; k <= p2; k <<= 1) {
+    for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+      for (uint32_t i = tx; i < p2; i += kBlockSize) {
+        const uint32_t l = i ^ j;
+        if (l > i) {
+          const bool up = (i & k) == 0;
+          const uint32_t ai = stage[i];
+          const uint32_t al = stage[l];
+          if (up == (ai > al)) {
+            stage[i] = al;
+            stage[l] = ai;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
+/// Canonicalize the output staging buffer of one row in place: overwrite the
+/// slots the arrival-order selection did not claim with -1, then sort `[0, topk)`
+/// ascending. `stage` holds the arrival-order selection in `[0, live)`; `topk`
+/// is the buffer's full width.
+///
+/// The sort rounds its span up to a power of two, so it has to see every slot of
+/// the padded span. Slots in `[live, topk)` are uninitialized leftovers, and
+/// slots in `[topk, p2)` are past the caller's fill; both are overwritten with
+/// -1 first, which as an unsigned value is UINT32_MAX and sorts past every live
+/// index. `live` must be read at a point where the select implementation's
+/// arrival-order counter is final and published -- that counter is exactly the
+/// ordering information being discarded, so it cannot be recovered afterwards.
+SGL_DEVICE void canonicalize_topk_output(int32_t* __restrict__ stage, const uint32_t live, const uint32_t topk) {
+  const auto tx = threadIdx.x;
+  for (uint32_t t = min(live, topk) + tx; t < topk; t += kBlockSize) {
+    stage[t] = -1;
+  }
+  __syncthreads();
+  sort_topk_output_ascending(reinterpret_cast<uint32_t*>(stage), topk);
+}
+
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
 struct alignas(8) GlobalMetadata {
@@ -248,6 +366,22 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
     }
   }
   using device::topk::broadcast;
+  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+#if SGL_TOPK_V2_DETERMINISTIC_EMIT
+  // Stage instead of writing the row's output directly, so the arrival-order
+  // permutation the select implementation produces can be canonicalized before
+  // it reaches the caller (see the emission-order note at the top of the file).
+  // `out` is untouched until the sorted buffer is copied over at the end.
+  __shared__ int32_t s_topk_indices[kMaxTopK];
+  auto problem = TopKProblem{
+      .in = score + (row_start - rem),
+      .out = s_topk_indices,
+      .topk = topk,
+      .seq_len = seq_len + rem,
+      .bias = broadcast(offset - static_cast<int32_t>(rem)),
+      .input_start = broadcast(rem),
+  };
+#else
   const auto problem = TopKProblem{
       .in = score + (row_start - rem),
       .out = out,
@@ -256,7 +390,7 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
       .bias = broadcast(offset - static_cast<int32_t>(rem)),
       .input_start = broadcast(rem),
   };
-  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+#endif
   if (problem.seq_len <= Register2::kMaxSeqLen) {
     Register2::forward<kPDL>(problem, &smem);
   } else if (problem.seq_len <= Register4::kMaxSeqLen) {
@@ -264,6 +398,19 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
   } else {
     Streaming::forward<kPDL>(problem, &smem);
   }
+#if SGL_TOPK_V2_DETERMINISTIC_EMIT
+  __syncthreads();
+  {
+    // `count_gt` is the number of slots the arrival-order selection claimed and
+    // the tie path continues from that same offset, so the live prefix is
+    // min(count_gt, topk) whichever implementation ran. The max-over-paths
+    // storage holds whichever Smem it used; they all place `count_gt` the same.
+    const auto live = reinterpret_cast<const typename Register2::Smem*>(&smem)->count_gt;
+    canonicalize_topk_output(s_topk_indices, live, topk);
+    __syncthreads();
+    for_each_item(topk, [&](uint32_t tx, uint32_t) { out[tx] = s_topk_indices[tx]; });
+  }
+#endif
   // PDL trigger secondary at the end the block typically has no use, so ignore it
 }
 
@@ -407,7 +554,16 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
   }
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
+#if SGL_TOPK_V2_DETERMINISTIC_EMIT
+  // Same canonicalization as `topk_main_kernel`: this path stages into
+  // `s_topk_indices` only to rebase through `bias` before the page transform.
+  const auto live = reinterpret_cast<const typename Register2::Smem*>(&smem)->count_gt;
+  canonicalize_topk_output(s_topk_indices, live, problem.topk);
+  __syncthreads();
   paged_transform<TopKMode::PAGE_TABLE>(problem, out, transform);
+#else
+  paged_transform<TopKMode::PAGE_TABLE>(problem, out, transform);
+#endif
 }
 #endif  // USE_ROCM
 
@@ -474,7 +630,29 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
     __syncthreads();
+#if SGL_TOPK_V2_DETERMINISTIC_EMIT
+    // Canonical order is enforced by sorting the staging buffer, so it only
+    // holds for the modes that stage. `INDICES` writes straight into the
+    // caller's output (no page table to rebase through), and nothing in the
+    // DSV4 deployment selects it -- fail the build rather than silently keep
+    // emitting in arrival order if that ever changes.
+    static_assert(kMode != TopKMode::INDICES, "canonical emission requires a staged output buffer");
+    // The select implementation filled `s_topk_indices` in arrival order and
+    // published its counters before this barrier; `count_gt` is the number of
+    // slots it claimed, and the tie path continues from that same offset, so
+    // the live prefix is min(count_gt, topk) on every one of them. The max-over-
+    // paths storage holds whichever Smem the dispatched path used. Register2,
+    // Register4 and Streaming all resolve `Smem` to `TopKRadixBase<12>::Smem`
+    // (the first two alias it, Streaming inherits it), so `count_gt` sits at the
+    // same offset for every one of them, well outside the union that the
+    // histogram and the tie machinery overlay.
+    const auto live = reinterpret_cast<const typename Register2::Smem*>(&smem)->count_gt;
+    canonicalize_topk_output(s_topk_indices, live, problem.topk);
+    __syncthreads();
     paged_transform<kMode>(problem, params.get_output_ptr(bx), params.get_transform(bx));
+#else
+    paged_transform<kMode>(problem, params.get_output_ptr(bx), params.get_transform(bx));
+#endif
   }
 }
 
@@ -906,6 +1084,13 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
     }
     if constexpr (kNeedStaging) {
       __syncthreads();
+#if SGL_TOPK_V2_DETERMINISTIC_EMIT
+      // Short rows elect rank 0 onto the ordinary one-block paths, which stage
+      // into `s_topk_indices` and must be canonicalized like `topk_main_kernel`.
+      const auto live = reinterpret_cast<const typename Register4::Smem*>(&smem)->count_gt;
+      canonicalize_topk_output(s_topk_indices, live, problem.topk);
+      __syncthreads();
+#endif
       paged_transform<kMode>(problem, params.get_output_ptr(row), params.get_transform(row));
     }
     return;
