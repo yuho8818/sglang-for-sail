@@ -406,6 +406,29 @@ class ReqToTokenPool:
                 (self._alloc_size, max_context_len), dtype=torch.int32, device=device
             )
         self.free_slots = list(range(1, self._alloc_size))
+        # Row 0 above is the reserved read source for idle and zero-padded rows
+        # (they all carry req_pool_indices=0), and its mapping is all zeros, i.e.
+        # every position points at KV cache location 0. The same rows also WRITE
+        # their dummy KV to location 0 (out_cache_loc=0), so location 0's content
+        # evolves on every decode step and carries the previous request's state
+        # into the next request's padding rows. Point the reserved row at cache
+        # location 1 instead, so the padding rows no longer read back what they
+        # themselves just wrote: their attention sees a location that padded rows
+        # never write, and its content is only whatever a real request last left
+        # there. Their dummy KV still goes to location 0, which nothing reads.
+        #
+        # Location 1 is NOT a reserved location. The paged KV allocator hands out
+        # locations from 1 upward (`free_pages = arange(1, size + 1)`), so 1 is
+        # the FIRST location a real request receives, and a real request's KV
+        # does overwrite it. This is therefore a reduction of the noise source
+        # (padding rows stop being self-polluted, and stop polluting their own
+        # read source), not the elimination of it: a still-allocated real request
+        # at location 1 can still be read by padding rows. Removing the residue
+        # entirely needs a location no request can ever be assigned, i.e. a
+        # reservation gap in the KV allocator or a dedicated constant page, which
+        # changes allocator semantics and capacity and is deliberately not done
+        # here.
+        self.req_to_token[0].fill_(1)
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
 
