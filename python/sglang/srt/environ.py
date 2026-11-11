@@ -1898,6 +1898,16 @@ class Envs:
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    # Canonical (ascending-index) emission order for the JIT dsv4 topk_v2 kernel.
+    # Its select implementations (TopKRegister / TopKStreaming /
+    # radix_tie_select) claim output slots with warp-arrival atomics, so the same
+    # selected set reaches the caller in a different permutation on every run.
+    # Sparse attention accumulates in emission order, which makes the permutation
+    # visible in the logits, and identical greedy requests then decode
+    # differently run to run. Compile-time flag: resolved when the JIT module is
+    # first built, so changing it needs a process restart. Set to 0 to restore
+    # the arrival-order emission.
+    SGLANG_TOPK_V2_DETERMINISTIC_EMIT = EnvBool(True)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)

@@ -51,6 +51,98 @@ constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 
 #define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
 
+// ---------------------------------------------------------------------------
+// Deterministic (canonical) emission order
+// ---------------------------------------------------------------------------
+//
+// `TopKRegister` / `TopKStreaming` / `radix_tie_select` assign their output
+// slots with `atomicAdd`, i.e. in warp-arrival order. The selected *set* is
+// order-independent, the *permutation* is not, and downstream sparse attention
+// accumulates in emission order -- so the permutation reaches the logits.
+//
+// Every path here funnels through one sink: `problem.out = s_topk_indices`,
+// written in arrival order, transformed by `paged_transform`. Sorting that
+// buffer in between canonicalizes all of them at once. What the sort buys is a
+// permutation that depends on the selected set alone, not a sorted row: it runs
+// on the raw selected positions and `paged_transform` then rebases them through
+// the page table, so the emitted slots are in page-table order.
+//
+// Compile-time gate `SGL_TOPK_V2_DETERMINISTIC_EMIT`, injected by the JIT loader
+// from `SGLANG_TOPK_V2_DETERMINISTIC_EMIT` (default on); it is resolved at build
+// time, so changing it needs a process restart. 0 restores arrival order.
+#if !defined(SGL_TOPK_V2_DETERMINISTIC_EMIT)
+#define SGL_TOPK_V2_DETERMINISTIC_EMIT 1
+#endif
+//
+// Out of scope by construction: the two arrival-order paths with no single
+// staging buffer to sort -- the cluster path (`SUPPORT_CLUSTER`, sm90/sm100)
+// and ROCm's `TopKSplit::select_chunk`. `SUPPORT_CLUSTER` requires
+// `SGL_CUDA_ARCH` in [900, 1100) and `USE_ROCM` is HIP-only, so neither is
+// compiled for this deployment.
+
+/// Block-wide bitonic sort of `stage[0, n)` ascending, unsigned. `kBlockSize`
+/// threads participate. `n` is rounded up to a power of two internally, and the
+/// `[n, p2)` entries the network compares are filled with -1 so they sort past
+/// the live entries instead of interleaving with them. Syncs once per network
+/// layer, so the staging writes that precede the first layer must be published by
+/// a `__syncthreads()` in the caller.
+SGL_DEVICE void sort_topk_output_ascending(uint32_t* __restrict__ stage, const uint32_t n) {
+  const auto tx = threadIdx.x;
+  if (n <= 1) return;
+  const uint32_t p2 = 1u << (32 - __clz(n - 1));
+  for (uint32_t t = n + tx; t < p2; t += kBlockSize) stage[t] = 0xFFFFFFFFu;
+  __syncthreads();
+  for (uint32_t k = 2; k <= p2; k <<= 1) {
+    for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+      for (uint32_t i = tx; i < p2; i += kBlockSize) {
+        const uint32_t l = i ^ j;
+        if (l > i) {
+          const bool up = (i & k) == 0;
+          const uint32_t ai = stage[i];
+          const uint32_t al = stage[l];
+          if (up == (ai > al)) {
+            stage[i] = al;
+            stage[l] = ai;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
+/// Canonicalize the output staging buffer of one row in place: sort `[0, topk)`
+/// ascending, so the emission order becomes a function of the selected set alone.
+///
+/// Every caller reaches the sort only when `seq_len > topk` (rows that fit the
+/// output take `trivial_transform` or the short-row early return and never
+/// stage), and on that branch all `topk` slots of the buffer are written before
+/// the sort -- so there is no stale slot to mask out and `topk` alone describes
+/// the live range:
+///
+///  - `TopKRegister` / `TopKStreaming`: phase 3 emits into `[0, count_gt)`, and
+///    `count_gt < topk` holds because the threshold bin is chosen so that fewer
+///    than `topk` elements are strictly above it (`find_threshold`). Phase 4,
+///    `handle_tie(..., base = count_gt, topk = topk - count_gt)`, therefore fills
+///    exactly `[count_gt, topk)`: the `num_ties <= topk` branch emits `num_ties`
+///    of them and pads the rest, while the rank-based branches (`num_ties <=
+///    kWarpSize`, `* 2`, `* 4`) emit every candidate whose exact rank is below
+///    `topk`, which the threshold-bin invariant makes all of them.
+///  - `radix_tie_select`: the scatter gives each element of a bin strictly above
+///    the threshold a slot from `counter`, and each element of the threshold bin
+///    a slot from `topk - topk_remain + counter_final`; the threshold bin is
+///    defined as the one containing rank `topk_remain`, so exactly `topk` slots
+///    are claimed.
+///  - `TopKCandidate`: the same structure as the two above on gathered columns.
+///
+/// Masking from `count_gt` instead would be wrong: it is only phase 3's
+/// "strictly above" count, which the tie path continues past without updating,
+/// so the tail of the threshold bin would be discarded and every row would end
+/// with a -1 tail.
+SGL_DEVICE void canonicalize_topk_output(int32_t* __restrict__ stage, const uint32_t topk) {
+  sort_topk_output_ascending(reinterpret_cast<uint32_t*>(stage), topk);
+}
+
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
 struct alignas(8) GlobalMetadata {
@@ -248,6 +340,22 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
     }
   }
   using device::topk::broadcast;
+  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+#if SGL_TOPK_V2_DETERMINISTIC_EMIT
+  // Stage instead of writing the row's output directly, so the arrival-order
+  // permutation the select implementation produces can be canonicalized before
+  // it reaches the caller (see the emission-order note at the top of the file).
+  // `out` is untouched until the sorted buffer is copied over at the end.
+  __shared__ int32_t s_topk_indices[kMaxTopK];
+  auto problem = TopKProblem{
+      .in = score + (row_start - rem),
+      .out = s_topk_indices,
+      .topk = topk,
+      .seq_len = seq_len + rem,
+      .bias = broadcast(offset - static_cast<int32_t>(rem)),
+      .input_start = broadcast(rem),
+  };
+#else
   const auto problem = TopKProblem{
       .in = score + (row_start - rem),
       .out = out,
@@ -256,7 +364,7 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
       .bias = broadcast(offset - static_cast<int32_t>(rem)),
       .input_start = broadcast(rem),
   };
-  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+#endif
   if (problem.seq_len <= Register2::kMaxSeqLen) {
     Register2::forward<kPDL>(problem, &smem);
   } else if (problem.seq_len <= Register4::kMaxSeqLen) {
@@ -264,6 +372,16 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
   } else {
     Streaming::forward<kPDL>(problem, &smem);
   }
+#if SGL_TOPK_V2_DETERMINISTIC_EMIT
+  __syncthreads();
+  {
+    // Every select path fills the whole `[0, topk)` range on this branch (see
+    // `canonicalize_topk_output`), so the sort covers the entire staging buffer.
+    canonicalize_topk_output(s_topk_indices, topk);
+    __syncthreads();
+    for_each_item(topk, [&](uint32_t tx, uint32_t) { out[tx] = s_topk_indices[tx]; });
+  }
+#endif
   // PDL trigger secondary at the end the block typically has no use, so ignore it
 }
 
@@ -407,7 +525,15 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
   }
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
+#if SGL_TOPK_V2_DETERMINISTIC_EMIT
+  // Same canonicalization as `topk_main_kernel`: this path stages into
+  // `s_topk_indices` only to rebase through `bias` before the page transform.
+  canonicalize_topk_output(s_topk_indices, problem.topk);
+  __syncthreads();
   paged_transform<TopKMode::PAGE_TABLE>(problem, out, transform);
+#else
+  paged_transform<TopKMode::PAGE_TABLE>(problem, out, transform);
+#endif
 }
 #endif  // USE_ROCM
 
@@ -474,7 +600,24 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
     __syncthreads();
+#if SGL_TOPK_V2_DETERMINISTIC_EMIT
+    // The select implementation filled `s_topk_indices` in arrival order and
+    // published its writes before this barrier. Every path that reaches here
+    // fills the whole `[0, topk)` range -- see `canonicalize_topk_output` -- so
+    // the sort covers all of it and nothing is left holding a stale index.
+    //
+    // This branch is compiled only for the modes that stage (`kNeedStaging`), so
+    // the canonicalization reaches exactly the modes it can help. `TopKMode::
+    // INDICES` does instantiate this kernel (the launcher below covers all three
+    // levels for whatever mode it is asked for), but its `if constexpr` body is
+    // empty, it writes straight into the caller's output and it is not selected
+    // by the DSV4 deployment.
+    canonicalize_topk_output(s_topk_indices, problem.topk);
+    __syncthreads();
     paged_transform<kMode>(problem, params.get_output_ptr(bx), params.get_transform(bx));
+#else
+    paged_transform<kMode>(problem, params.get_output_ptr(bx), params.get_transform(bx));
+#endif
   }
 }
 
@@ -906,6 +1049,12 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
     }
     if constexpr (kNeedStaging) {
       __syncthreads();
+#if SGL_TOPK_V2_DETERMINISTIC_EMIT
+      // Short rows elect rank 0 onto the ordinary one-block paths, which stage
+      // into `s_topk_indices` and must be canonicalized like `topk_main_kernel`.
+      canonicalize_topk_output(s_topk_indices, problem.topk);
+      __syncthreads();
+#endif
       paged_transform<kMode>(problem, params.get_output_ptr(row), params.get_transform(row));
     }
     return;
