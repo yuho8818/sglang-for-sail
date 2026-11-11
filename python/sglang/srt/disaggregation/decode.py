@@ -197,6 +197,16 @@ class DecodeReqToTokenPool:
             )
 
         self.free_slots = list(range(1, self._alloc_size))
+        # Mirror ReqToTokenPool's reserved row 0: it is the read source for idle
+        # and zero-padded rows, which all carry req_pool_indices=0, while those
+        # same rows write their dummy KV to location 0. Pointing the row at
+        # location 1 keeps the padding rows from reading back what they just
+        # wrote. This pool is the one a PD decode node builds, i.e. exactly the
+        # node where decode padding happens, so leaving it on the all-zero
+        # mapping would leave the fix inactive where it matters.
+        #
+        # See ReqToTokenPool for what location 1 is at each page size.
+        self.req_to_token[0].fill_(1)
         # Slot-reuse generation counter; mirrors ReqToTokenPool. Required even
         # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
         # inheriting ReqToTokenPool.alloc, which bumps it.
