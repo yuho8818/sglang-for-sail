@@ -35,9 +35,16 @@ class _SwaCache(RadixCache):
     def supports_auxiliary_swa(self):
         return self.auxiliary
 
-    def evict_sliding_windows(self, req, pre_len, *, eviction_interval=1):
+    def evict_sliding_windows(
+        self, req, pre_len, *, eviction_interval=1, defer_last_window=False
+    ):
         self.trim_calls += 1
-        super().evict_sliding_windows(req, pre_len, eviction_interval=eviction_interval)
+        super().evict_sliding_windows(
+            req,
+            pre_len,
+            eviction_interval=eviction_interval,
+            defer_last_window=defer_last_window,
+        )
 
 
 class TestSWAEvictionInterval(unittest.TestCase):
@@ -57,6 +64,10 @@ class TestSWAEvictionInterval(unittest.TestCase):
                     kv=ReqKvInfo(
                         req_pool_idx=0,
                         cache_protected_len=protected,
+                        # A decoding request has already published its prefix, so
+                        # no later insert will capture a retained window; the
+                        # defer is skipped on this path by design.
+                        cache_inserted_len=protected,
                         swa_evict_floor=shield,
                     ),
                 )

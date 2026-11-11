@@ -3955,8 +3955,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _evict_swa(self, req: Req, pre_len: int, *, eviction_interval: int = 1):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
+        # Retaining a window only pays off when a later insert can still capture
+        # it. Once the request's prefix has been inserted (the decode path, where
+        # `cache_inserted_len` covers the prefix), no further insert will publish
+        # this span, so holding it would pin SWA slots for nothing — the retained
+        # window would sit idle until some much later trim happened to release
+        # it. Defer only while the prefix is still unpublished.
+        defer = req.kv.cache_inserted_len < req.kv.cache_protected_len
         self.tree_cache.evict_sliding_windows(
-            req, pre_len, eviction_interval=eviction_interval
+            req,
+            pre_len,
+            eviction_interval=eviction_interval,
+            defer_last_window=defer,
         )
 
     def __str__(self):

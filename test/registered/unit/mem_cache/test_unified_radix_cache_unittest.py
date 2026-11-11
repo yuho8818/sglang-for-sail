@@ -3038,19 +3038,33 @@ class UnifiedRadixCacheSuite:
             cache.checkpoint(req, up_to=req.extend_end)
 
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
+        # The trim holds one window above the frontier back for the following
+        # insert to capture, so the frontier advances by the cushion minus that
+        # retained window. What this test pins is that the trim still advances
+        # and that the pool reclaims what it freed, not the exact frontier.
+        deferred_window = (
+            cushion if envs.SGLANG_OPT_SWA_DEFER_LAST_WINDOW.get() else 0
+        )
         expected_evicted = (pre_len - 1) - cushion
+        actual_evicted = req.kv.get_evicted_seqlen(ComponentType.SWA)
         self.assertEqual(
-            req.kv.get_evicted_seqlen(ComponentType.SWA),
-            expected_evicted,
-            f"swa_evicted_seqlen should advance to (pre_len-1) - cushion = "
-            f"{expected_evicted}, got {req.kv.get_evicted_seqlen(ComponentType.SWA)}",
+            actual_evicted,
+            expected_evicted - deferred_window,
+            f"swa_evicted_seqlen should advance to (pre_len-1) - cushion "
+            f"(- the retained window when deferring) = "
+            f"{expected_evicted - deferred_window}, got {actual_evicted}",
+        )
+        self.assertGreater(
+            actual_evicted,
+            0,
+            "the trim must still advance the frontier on an unfinished request",
         )
 
         swa_avail_after = allocator.swa_attn_allocator.available_size()
         self.assertGreaterEqual(
             swa_avail_after - swa_avail_before,
-            expected_evicted,
-            f"SWA pool should have freed at least {expected_evicted} slots; "
+            actual_evicted,
+            f"SWA pool should have freed at least {actual_evicted} slots; "
             f"before={swa_avail_before}, after={swa_avail_after}",
         )
 
