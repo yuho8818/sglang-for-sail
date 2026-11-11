@@ -932,65 +932,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         def _all_valid(validators, node):
             return all([v(node) for v in validators])
 
-        # Segment-level degradation, scoped to SWA. _clip_to_window() declines a
-        # span whose live window starts at or past its end, which tombstones that
-        # node's SWA value while its Full value stays populated. The walk visits
-        # such a node anyway and appends its Full value to `value`, but every
-        # component's validator has to agree before best_match_node advances, so
-        # a SWA tombstone left the anchor at the root and threw away the Full-side
-        # hit. Remember the deepest visited node carrying Full device data so the
-        # anchor can still be placed there. Other components keep their own
-        # semantics: a Mamba node with no state must still pull the anchor back to
-        # the root, which the Mamba branching tests pin.
-        salvage_swa_anchor = envs.SGLANG_OPT_SWA_SEGMENT_DEGRADE.get()
-        swa_component = self.components_by_type.get(ComponentType.SWA)
-        # Verdicts of the non-SWA auxiliary components, captured in the same pass
-        # that consumes the stateful validators (each may only be called once per
-        # node). A non-SWA rejection must keep vetoing the anchor.
-        other_verdicts: list[bool] = []
-        full_anchor_node = node
-
-        def _swa_span_is_tombstoned(node):
-            """SWA declined this span while its Full KV stayed resident.
-
-            SWA is the only component that tombstones a span yet leaves Full
-            reusable: `_clip_to_window` refuses a span whose live window starts at
-            or past its end. Mamba keeps a single state slot per node and its
-            absence genuinely means "no state here", so it is not covered here.
-
-            A host-backed SWA value is excluded: the validator already accepts
-            such a node as a valid boundary (load_back restores the SWA from the
-            host pool), so there is nothing to salvage.
-            """
-            if swa_component is None or node.evicted:
-                return False
-            if node.component_data[BASE_COMPONENT_TYPE].value is None:
-                return False
-            swa_cd = node.component_data[ComponentType.SWA]
-            if swa_cd.value is not None or swa_cd.host_value is not None:
-                return False
-            return True
-
         def _update_best_if_valid(node):
             nonlocal best_match_node
             nonlocal best_match_device_value_len, best_match_device_node
-            nonlocal full_anchor_node
-            # Each stateful validator must be consumed exactly once per node, so
-            # evaluate them once and derive both the combined answer and the
-            # auxiliary-only answer from that single pass.
-            verdicts = [v(node) for v in validators]
-            aux_verdicts = [
-                verdict
-                for comp, verdict in zip(self.components, verdicts)
-                if comp.component_type != BASE_COMPONENT_TYPE
-                and not comp.component_type.is_swa
-            ]
-            other_verdicts.append(all(aux_verdicts))
-            matched = all(verdicts)
+            matched = _all_valid(validators, node)
             if matched:
                 best_match_node = node
-            if salvage_swa_anchor and _swa_span_is_tombstoned(node):
-                full_anchor_node = node
 
             if not separate_device_match:
                 if matched:
@@ -1024,28 +971,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             key_offset += prefix_len
             if key_offset < len(key):
                 child_key = key.child_key_at(key_offset, self.page_size)
-
-        # Segment-level degradation: if a SWA tombstone turned the walk into a
-        # no-match (the anchor left at the root) even though Full KV was resident
-        # along the path, anchor on the deepest Full-bearing node so the Full-side
-        # hit is not lost. Restricted to the case where SWA was the only
-        # dissenting component, so a Mamba veto still pulls the anchor to the
-        # root as its branching tests require.
-        #
-        # best_match_device_value_len is deliberately left alone: device_prefix_len
-        # is the SWA-valid boundary that swa_branching_seqlen is derived from, and
-        # overstating it would tell the runtime to skip re-prefilling a span whose
-        # SWA was never captured. SWAComponent.finalize_match_result_in_tree_core
-        # already reports "Full KV extends beyond the reusable SWA window" from
-        # full_kv_hit_length, so the SWA boundary keeps its own, un-salvaged value.
-        if (
-            salvage_swa_anchor
-            and best_match_node is self.root_node
-            and swa_component is not None
-            and full_anchor_node is not self.root_node
-            and all(other_verdicts)
-        ):
-            best_match_node = full_anchor_node
 
         return (
             value,
