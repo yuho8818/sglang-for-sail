@@ -702,6 +702,16 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Segment-level SWA degradation. _clip_to_window() declines a span whose live
+    # window starts at or past its end, which leaves the node's SWA value None
+    # while its Full value stays populated. The SWA match validator treated that
+    # tombstone as a rejection of the whole path, so a request whose shared prefix
+    # ends before an already-cached key's end paid a full recompute even though
+    # the Full KV it needed was still resident. With this on, the validator
+    # reports a tombstoned span as matchable and the walk keeps descending, so the
+    # Full-side hit survives; the SWA span itself stays unusable. Off restores the
+    # original whole-path rejection.
+    SGLANG_OPT_SWA_SEGMENT_DEGRADE = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
