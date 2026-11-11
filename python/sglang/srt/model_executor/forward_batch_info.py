@@ -1660,6 +1660,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=0,
             )
 
+    def _clone_pad_tensor_to_size(self, tensor: torch.Tensor, size: int):
+        """Pad `tensor` to `size` rows by replicating row 0.
+
+        Used for decode-batch padding: the padded rows become exact replicas of
+        the first real row, so every read, KV write and request-scoped state
+        write they perform is an idempotent copy of row 0's, and their
+        contribution is a fixed function of the real batch (see
+        `_pad_inputs_to_size`).
+        """
+        n = tensor.shape[0]
+        if size <= n:
+            return tensor
+        fill = tensor[:1].expand(size - n, *tensor.shape[1:])
+        return torch.cat([tensor, fill], dim=0)
+
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
@@ -1888,7 +1903,41 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
         self._original_num_tokens = self.positions.shape[0]
-        self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
+        # Decode batches are padded to the attn-TP multiple (or the captured
+        # cuda-graph bs) with dummy rows. With the default zero/fill padding those
+        # rows carry req_pool_indices=0, out_cache_loc=0 and seq_len=fill, so
+        # their attention reads whatever request slot 0 last mapped to and their
+        # KV writes land on cache location 0: the rows compute a run-dependent
+        # function of stale state, and that noise reaches real rows through
+        # batch-spanning ops (observed as greedy flips on identical requests).
+        # Replicating row 0 into the padding rows instead makes every read, KV
+        # write and request-scoped state write an idempotent copy of row 0's, so
+        # the padding rows are a fixed function of the real batch.
+        #
+        # Only DECODE batches: TARGET_VERIFY pads inside the spec block and keeps
+        # its own semantics, and idle rows are fully masked downstream.
+        #
+        # Not a DECODE batch carrying a draft spec_info either: further down it
+        # pads its own fields with zeros (`hidden_states`, `topk_p`,
+        # `topk_index`), so its padding rows would run row 0's input ids and
+        # positions through a different draft state and write that result into
+        # row 0's own KV slots -- not replicas, but a second, divergent writer of
+        # the same locations. Those batches stay on the fill path until the draft
+        # fields are replicated too.
+        clone_first = (
+            envs.SGLANG_DECODE_PAD_CLONE_FIRST_ROW.get()
+            and self.forward_mode.is_decode()
+            and self.positions.shape[0] > 0
+            and (self.spec_info is None or not self.spec_info.is_draft_input())
+            and (
+                num_tokens > self.positions.shape[0]
+                or bs > self.req_pool_indices.shape[0]
+            )
+        )
+        if clone_first:
+            self.input_ids = self._clone_pad_tensor_to_size(self.input_ids, num_tokens)
+        else:
+            self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         if self.input_embeds is not None:
             # Keep token-aligned inputs consistent after padding.
             self.input_embeds = self._pad_tensor_to_size(self.input_embeds, num_tokens)
@@ -1900,11 +1949,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mm_input_embeds = self._pad_tensor_to_size(
                 self.mm_input_embeds, num_tokens
             )
-        self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
-        if self.req_pool_indices_cpu is not None:
-            self.req_pool_indices_cpu = self._pad_tensor_to_size(
-                self.req_pool_indices_cpu, bs
+        if clone_first:
+            self.req_pool_indices = self._clone_pad_tensor_to_size(
+                self.req_pool_indices, bs
             )
+            if self.req_pool_indices_cpu is not None:
+                self.req_pool_indices_cpu = self._clone_pad_tensor_to_size(
+                    self.req_pool_indices_cpu, bs
+                )
+        else:
+            self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
+            if self.req_pool_indices_cpu is not None:
+                self.req_pool_indices_cpu = self._pad_tensor_to_size(
+                    self.req_pool_indices_cpu, bs
+                )
         if self.lora_ids is not None:
             self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
@@ -1913,28 +1971,61 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if _is_cpu
             else model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
-        # Keep gpu_only batches sync-free: leave seq_lens_sum None and let the
-        # attention backend over-allocate from an upper bound (see #26738).
-        if self.seq_lens_sum is not None:
-            self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
-                bs - self.seq_lens.shape[0]
+        if clone_first:
+            # Row 0's length for every padded row. Keep seq_lens_sum exact through
+            # the host copy when it exists; without one, fall back to the
+            # backend's over-allocation path (see #26738) rather than
+            # under-reporting the cloned rows' windows.
+            first_seq_len = (
+                int(self.seq_lens_cpu[0].item())
+                if self.seq_lens_cpu is not None
+                else None
             )
-        self.seq_lens = self._pad_tensor_to_size(
-            self.seq_lens, bs, value=seq_len_fill_value
-        )
-        if self.seq_lens_cpu is not None:
-            self.seq_lens_cpu = self._pad_tensor_to_size(
-                self.seq_lens_cpu, bs, value=seq_len_fill_value
+            if self.seq_lens_sum is not None:
+                if first_seq_len is not None:
+                    self.seq_lens_sum = self.seq_lens_sum + first_seq_len * (
+                        bs - self.seq_lens.shape[0]
+                    )
+                else:
+                    self.seq_lens_sum = None
+            self.seq_lens = self._clone_pad_tensor_to_size(self.seq_lens, bs)
+            if self.seq_lens_cpu is not None:
+                self.seq_lens_cpu = self._clone_pad_tensor_to_size(
+                    self.seq_lens_cpu, bs
+                )
+        else:
+            # Keep gpu_only batches sync-free: leave seq_lens_sum None and let the
+            # attention backend over-allocate from an upper bound (see #26738).
+            if self.seq_lens_sum is not None:
+                self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
+                    bs - self.seq_lens.shape[0]
+                )
+            self.seq_lens = self._pad_tensor_to_size(
+                self.seq_lens, bs, value=seq_len_fill_value
             )
+            if self.seq_lens_cpu is not None:
+                self.seq_lens_cpu = self._pad_tensor_to_size(
+                    self.seq_lens_cpu, bs, value=seq_len_fill_value
+                )
 
-        self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        if clone_first:
+            self.out_cache_loc = self._clone_pad_tensor_to_size(
+                self.out_cache_loc, num_tokens
+            )
+        else:
+            self.out_cache_loc = self._pad_tensor_to_size(
+                self.out_cache_loc, num_tokens
+            )
         if self.origin_out_cache_loc is not None:
             self.origin_out_cache_loc = self._pad_tensor_to_size(
                 self.origin_out_cache_loc, num_tokens
             )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
-        self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
+        if clone_first:
+            self.positions = self._clone_pad_tensor_to_size(self.positions, num_tokens)
+        else:
+            self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
         if self.mamba_track_indices is not None:
             self.mamba_track_indices = self._pad_tensor_to_size(
                 self.mamba_track_indices, bs
