@@ -702,15 +702,6 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
-    # Keep one max(window, page) range above the SWA eviction frontier alive so
-    # the insert that follows the trim can still capture that span as tree-owned
-    # SWA. Without it the trim frees the body's SWA while it is only in the
-    # request ring, and a later request whose shared prefix ends inside that span
-    # lands in the tombstone region and pays a full recompute (first-touch).
-    # The retained span is clamped to cache_protected_len, so it survives exactly
-    # until the tree has taken ownership of it; the next trim releases it
-    # otherwise. Off restores the original trim boundary.
-    SGLANG_OPT_SWA_DEFER_LAST_WINDOW = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:

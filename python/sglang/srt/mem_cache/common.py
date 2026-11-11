@@ -68,7 +68,6 @@ def free_swa_out_of_window_slots(
     component_type: ComponentType = ComponentType.SWA,
     free_segment: Callable[..., None] | None = None,
     eviction_interval: int = 1,
-    defer_last_window: bool = False,
 ) -> None:
     if not req.kv.holds_kv:
         return
@@ -111,34 +110,14 @@ def free_swa_out_of_window_slots(
         new_evicted_seqlen = (new_evicted_seqlen // page_size) * page_size
 
     if new_evicted_seqlen > evicted_seqlen:
-        # Hold back one window above the eviction frontier so the insert that
-        # follows this trim can still capture that span as tree-owned SWA.
-        # Without it the trim frees the body's SWA while it is still only in the
-        # request ring, and the next request matching inside that span lands in
-        # the tombstone region and pays a full recompute (first-touch).
-        free_end = new_evicted_seqlen
-        if (
-            defer_last_window
-            and supports_prefix_sharing
-            and envs.SGLANG_OPT_SWA_DEFER_LAST_WINDOW.get()
-        ):
-            # The retained window must survive until the next insert has captured
-            # it. `cache_protected_len` is that boundary: it advances when the
-            # tree takes ownership, so clamping the retained span to it keeps the
-            # window alive exactly until it is captured and no longer.
-            keep_from = new_evicted_seqlen - max(sliding_window_size, page_size)
-            keep_from = max(keep_from, req.kv.cache_protected_len)
-            if page_size > 1:
-                keep_from = (keep_from // page_size) * page_size
-            free_end = max(evicted_seqlen, keep_from)
         free_slots = req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, evicted_seqlen:free_end
+            req.kv.req_pool_idx, evicted_seqlen:new_evicted_seqlen
         ]
         if free_segment is None:
             assert component_type == ComponentType.SWA
             free_segment = token_to_kv_pool_allocator.free_swa_segment
         free_segment(free_slots, start_pos=evicted_seqlen)
-        req.kv.set_evicted_seqlen(component_type, free_end)
+        req.kv.set_evicted_seqlen(component_type, new_evicted_seqlen)
 
 
 def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
