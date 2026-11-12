@@ -55,6 +55,64 @@ def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
 
+# Below this share of the SWA pool that is free or held only by evictable tree
+# nodes, the pre-insert trim keeps its original behavior instead of retaining.
+SWA_RETAIN_MIN_RECLAIMABLE_RATIO = 0.10
+
+
+def _read_swa_free_tokens(token_to_kv_pool_allocator: Any) -> Optional[int]:
+    available = getattr(token_to_kv_pool_allocator, "swa_available_size", None)
+    if available is None:
+        return None
+    try:
+        return int(available() if callable(available) else available)
+    except Exception:
+        return None
+
+
+def _read_swa_capacity_tokens(token_to_kv_pool_allocator: Any) -> Optional[int]:
+    # `current_swa_capacity` is the live (byte-coordinated) capacity the pool-usage
+    # metric uses; `size_swa` is the configured bound it can sit below.
+    for name in ("current_swa_capacity", "size_swa"):
+        value = getattr(token_to_kv_pool_allocator, name, None)
+        if value is None:
+            continue
+        try:
+            capacity = int(value() if callable(value) else value)
+        except Exception:
+            continue
+        if capacity > 0:
+            return capacity
+    return None
+
+
+def swa_reclaimable_ratio(
+    token_to_kv_pool_allocator: Any, evictable_tokens: int
+) -> Optional[float]:
+    """Share of the SWA pool that is free or held only by evictable tree nodes,
+    or None when the pool cannot report it."""
+    free_tokens = _read_swa_free_tokens(token_to_kv_pool_allocator)
+    if free_tokens is None:
+        return None
+    capacity = _read_swa_capacity_tokens(token_to_kv_pool_allocator)
+    if capacity is None:
+        return None
+    return min(1.0, (free_tokens + max(0, evictable_tokens)) / capacity)
+
+
+def swa_pool_can_retain(
+    token_to_kv_pool_allocator: Any, evictable_tokens: int
+) -> bool:
+    """Whether the pool has room to keep a request's unpublished SWA.
+
+    Retained SWA is evictable as soon as the insert publishes it, so only rows
+    pinned by running requests count as pressure. An unreadable pool falls back
+    to trimming.
+    """
+    ratio = swa_reclaimable_ratio(token_to_kv_pool_allocator, evictable_tokens)
+    return ratio is not None and ratio >= SWA_RETAIN_MIN_RECLAIMABLE_RATIO
+
+
 def free_swa_out_of_window_slots(
     req: Req,
     pre_len: int,
@@ -68,6 +126,7 @@ def free_swa_out_of_window_slots(
     component_type: ComponentType = ComponentType.SWA,
     free_segment: Callable[..., None] | None = None,
     eviction_interval: int = 1,
+    retain_unpublished: bool = False,
 ) -> None:
     if not req.kv.holds_kv:
         return
@@ -103,6 +162,13 @@ def free_swa_out_of_window_slots(
         # this only promises not to free past it. Without prefix sharing a retained
         # checkpoint could never be matched, so holding it is pure cost.
         evict_threshold = min(evict_threshold, retain_floor)
+
+    if retain_unpublished and supports_prefix_sharing:
+        # Hold the frontier at what the tree already owns. Trimming into the span
+        # the following insert adopts leaves that node an SWA tombstone, so a later
+        # request whose shared prefix ends inside the span cannot match it. The
+        # whole span is kept, not one window: any cut point needs its own window.
+        evict_threshold = min(evict_threshold, dead_lo)
 
     new_evicted_seqlen = max(evicted_seqlen, evict_threshold)
 

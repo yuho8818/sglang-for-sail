@@ -702,6 +702,10 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Keep a request's not-yet-published SWA through the trim before its insert,
+    # so a prefix cut anywhere inside the inserted span can match on first touch.
+    # Costs SWA pool space; falls back to trimming when the pool is tight.
+    SGLANG_OPT_SWA_RETAIN_UNPUBLISHED = EnvBool(False)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:

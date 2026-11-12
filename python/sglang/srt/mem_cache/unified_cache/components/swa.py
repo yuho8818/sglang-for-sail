@@ -15,7 +15,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+from sglang.srt.mem_cache.common import (
+    free_swa_out_of_window_slots,
+    swa_pool_can_retain,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1002,7 +1005,9 @@ class SWAComponent(TreeComponent):
         insert_params.swa_branching_seqlen = branching_seqlen
         return effective_cache_len
 
-    def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
+    def _free_out_of_window_slots(
+        self, req: Req, pre_len: int, *, retain_unpublished: bool = False
+    ) -> None:
         if self.sliding_window_size is None:
             return
         free_swa_out_of_window_slots(
@@ -1013,12 +1018,17 @@ class SWAComponent(TreeComponent):
             req_to_token_pool=self.cache.req_to_token_pool,
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
             retain_floor=self.cache.swa_retain_floor(req),
+            retain_unpublished=retain_unpublished,
         )
 
     def free_out_of_window_slots(
         self, req: Req, pre_len: int, insert_params: InsertParams
     ) -> None:
-        self._free_out_of_window_slots(req, pre_len)
+        # The trim right before an insert; the other trims never retain.
+        retain = envs.SGLANG_OPT_SWA_RETAIN_UNPUBLISHED.get() and swa_pool_can_retain(
+            self.cache.token_to_kv_pool_allocator, self.cache.swa_evictable_size()
+        )
+        self._free_out_of_window_slots(req, pre_len, retain_unpublished=retain)
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )
