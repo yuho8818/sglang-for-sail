@@ -15,7 +15,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+from sglang.srt.mem_cache.common import (
+    free_swa_out_of_window_slots,
+    swa_retain_decision,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1002,7 +1005,14 @@ class SWAComponent(TreeComponent):
         insert_params.swa_branching_seqlen = branching_seqlen
         return effective_cache_len
 
-    def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
+    def _free_out_of_window_slots(
+        self,
+        req: Req,
+        pre_len: int,
+        *,
+        retain_unpublished: bool = False,
+        retain_site: str = "decode",
+    ) -> None:
         if self.sliding_window_size is None:
             return
         free_swa_out_of_window_slots(
@@ -1013,12 +1023,31 @@ class SWAComponent(TreeComponent):
             req_to_token_pool=self.cache.req_to_token_pool,
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
             retain_floor=self.cache.swa_retain_floor(req),
+            retain_unpublished=retain_unpublished,
+            retain_site=retain_site,
         )
 
     def free_out_of_window_slots(
-        self, req: Req, pre_len: int, insert_params: InsertParams
+        self,
+        req: Req,
+        pre_len: int,
+        insert_params: InsertParams,
+        *,
+        retain_site: str = "pre_insert",
     ) -> None:
-        self._free_out_of_window_slots(req, pre_len)
+        # This is the trim that runs immediately before an insert, so it is the
+        # one that can publish a tombstone. Ask the pressure guard here (not in
+        # the caller) so both pre-insert call sites share one policy. The guard
+        # records its own TRACE counter, so do not count again here.
+        retain, _reason = swa_retain_decision(
+            self.cache.token_to_kv_pool_allocator, site=retain_site
+        )
+        self._free_out_of_window_slots(
+            req,
+            pre_len,
+            retain_unpublished=retain,
+            retain_site=retain_site,
+        )
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )
@@ -1041,7 +1070,9 @@ class SWAComponent(TreeComponent):
             and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
         ):
             forward_key_len = len(req.get_fill_ids()) - int(self.tree_core.is_eagle)
-            self._free_out_of_window_slots(req, forward_key_len - 1)
+            self._free_out_of_window_slots(
+                req, forward_key_len - 1, retain_site="post_insert:cleanup"
+            )
 
     # ---- HiCache Hooks ----
 

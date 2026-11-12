@@ -702,6 +702,20 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Keep a request's not-yet-published SWA alive until the insert captures it,
+    # instead of trimming it immediately before that insert. The pre-insert trim
+    # frees SWA the tree is about to adopt, so the node lands as a tombstone and a
+    # first-touch request whose shared prefix ends before the cached key's end
+    # reports `cached_tokens = 0`.
+    SGLANG_OPT_SWA_RETAIN_UNPUBLISHED = EnvBool(False)
+    # Pressure fallback for the switch above: when the SWA pool's free ratio drops
+    # below this value, take the original trimming path instead of retaining, so a
+    # tight pool degrades hits rather than exhausting slots. 0.0 never falls back;
+    # 1.0 always falls back.
+    SGLANG_SWA_RETAIN_MIN_FREE_RATIO = EnvFloat(0.10)
+    # One-shot diagnostics for the retain path: per-call-site counters for the
+    # retained and the fell-back branches. Off by default.
+    SGLANG_DEBUG_SWA_RETAIN_TRACE = EnvBool(False)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:

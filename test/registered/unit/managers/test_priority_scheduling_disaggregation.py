@@ -287,7 +287,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         ]
         self.assertEqual(prepare_params.prev_prefix_len, 2)
         component.free_out_of_window_slots.assert_called_once_with(
-            req, 3, prepare_params
+            req, 3, prepare_params, retain_site="pre_insert:advance_unpublished_req"
         )
         component.cleanup_after_caching_req.assert_called_once_with(
             req, is_finished=False, insert_params=prepare_params

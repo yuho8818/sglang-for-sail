@@ -703,7 +703,12 @@ class TreeComponent(ABC):
         pass
 
     def free_out_of_window_slots(
-        self, req: Req, pre_len: int, insert_params: InsertParams
+        self,
+        req: Req,
+        pre_len: int,
+        insert_params: InsertParams,
+        *,
+        retain_site: str = "pre_insert",
     ) -> None:
         pass
 

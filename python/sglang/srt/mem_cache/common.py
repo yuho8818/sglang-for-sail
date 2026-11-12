@@ -55,6 +55,142 @@ def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
 
+# ---- SWA retain-unpublished diagnostics (one-shot, env-gated) ----
+#
+# Counters are per call site so a single run proves which path actually retained:
+#   "pre_insert:<caller>"  -- the trim that runs immediately before an insert
+#                             (UnifiedRadixCache.checkpoint_into_tree /
+#                              UnifiedRadixCache.advance_unpublished_req /
+#                              SWAComponent.cleanup_after_caching_req)
+#   "decode"               -- the periodic decode-side eviction
+# The retained count proves the new branch executed; the fallback counters prove
+# the pressure guard was reached instead of silently retaining through a full pool.
+SWA_RETAIN_TRACE: dict[str, int] = {}
+_SWA_RETAIN_TRACE_LOGGED = False
+
+
+def swa_retain_trace_enabled() -> bool:
+    return envs.SGLANG_DEBUG_SWA_RETAIN_TRACE.get()
+
+
+def _swa_retain_trace_record(site: str, branch: str) -> None:
+    if not swa_retain_trace_enabled():
+        return
+    key = f"{site}/{branch}"
+    SWA_RETAIN_TRACE[key] = SWA_RETAIN_TRACE.get(key, 0) + 1
+    logger.info("[SWA-RETAIN-TRACE] %s -> %s (total=%d)", site, branch, SWA_RETAIN_TRACE[key])
+
+
+def _swa_retain_detail(
+    site: str,
+    *,
+    pre_len: int,
+    protected: int,
+    dead_lo: int,
+    old_threshold: int,
+    new_frontier: int,
+    window: int,
+    page: int,
+) -> None:
+    """One line per trim carrying the numbers the verdict depends on.
+
+    The counters above say which branch ran; this says what it computed, so a
+    frontier that refuses to move can be read off the log instead of inferred.
+    """
+    if not swa_retain_trace_enabled():
+        return
+    logger.info(
+        "[SWA-RETAIN-DETAIL] site=%s pre_len=%d protected=%d dead_lo=%d "
+        "old_threshold=%d new_frontier=%d window=%d page=%d",
+        site,
+        pre_len,
+        protected,
+        dead_lo,
+        old_threshold,
+        new_frontier,
+        window,
+        page,
+    )
+
+
+def swa_retain_trace_summary() -> dict[str, int]:
+    """Snapshot of the counters; also usable after a run for the evidence file."""
+    return dict(SWA_RETAIN_TRACE)
+
+
+def _read_swa_free_tokens(token_to_kv_pool_allocator: Any) -> Optional[int]:
+    available = getattr(token_to_kv_pool_allocator, "swa_available_size", None)
+    if available is None:
+        return None
+    try:
+        return int(available() if callable(available) else available)
+    except Exception:  # pragma: no cover - reporting must not break eviction
+        return None
+
+
+def _read_swa_capacity_tokens(token_to_kv_pool_allocator: Any) -> Optional[int]:
+    """Live SWA capacity in tokens.
+
+    The hybrid-SWA allocators expose `current_swa_capacity` (free + allocated),
+    which is the same denominator `swa_capacity_and_available` reports and so the
+    one the pool-usage metric is computed against. `size_swa` is the configured
+    bound; it is a fallback, not the first choice, because the byte-coordinated
+    live capacity can sit below it.
+    """
+    for name in ("current_swa_capacity", "size_swa"):
+        value = getattr(token_to_kv_pool_allocator, name, None)
+        if value is None:
+            continue
+        try:
+            capacity = int(value() if callable(value) else value)
+        except Exception:  # pragma: no cover
+            continue
+        if capacity > 0:
+            return capacity
+    return None
+
+
+def swa_available_ratio(token_to_kv_pool_allocator: Any) -> Optional[float]:
+    """Free ratio of the SWA pool, or None when the pool cannot report it.
+
+    Returns None (rather than raising) for a non-hybrid-SWA allocator, an
+    unreadable counter, or a zero capacity; the caller treats that as fail-closed.
+    """
+    free_tokens = _read_swa_free_tokens(token_to_kv_pool_allocator)
+    if free_tokens is None:
+        return None
+    capacity = _read_swa_capacity_tokens(token_to_kv_pool_allocator)
+    if capacity is None or capacity <= 0:
+        return None
+    return free_tokens / capacity
+
+
+def swa_retain_decision(
+    token_to_kv_pool_allocator: Any, *, site: str
+) -> tuple[bool, str]:
+    """Decide whether to retain, applying the pressure fallback.
+
+    Returns ``(retain, reason)``. Never raises: an unreadable pool reading falls
+    back to the original trimming behavior (fail-closed, hits are lost rather
+    than slots exhausted).
+
+    This is the single place that records the TRACE counter, so a fallback is
+    counted once rather than once per caller.
+    """
+    if not envs.SGLANG_OPT_SWA_RETAIN_UNPUBLISHED.get():
+        return False, "switch_off"
+    min_ratio = envs.SGLANG_SWA_RETAIN_MIN_FREE_RATIO.get()
+    ratio = swa_available_ratio(token_to_kv_pool_allocator)
+    if ratio is None:
+        _swa_retain_trace_record(site, "fallback_unreadable")
+        return False, "fallback_unreadable"
+    if ratio < min_ratio:
+        _swa_retain_trace_record(site, "fallback_pressure")
+        return False, "fallback_pressure"
+    _swa_retain_trace_record(site, "retained")
+    return True, "retained"
+
+
 def free_swa_out_of_window_slots(
     req: Req,
     pre_len: int,
@@ -68,6 +204,8 @@ def free_swa_out_of_window_slots(
     component_type: ComponentType = ComponentType.SWA,
     free_segment: Callable[..., None] | None = None,
     eviction_interval: int = 1,
+    retain_unpublished: bool = False,
+    retain_site: str = "unknown",
 ) -> None:
     if not req.kv.holds_kv:
         return
@@ -104,10 +242,43 @@ def free_swa_out_of_window_slots(
         # checkpoint could never be matched, so holding it is pure cost.
         evict_threshold = min(evict_threshold, retain_floor)
 
+    if retain_unpublished and supports_prefix_sharing:
+        # This trim runs immediately before the caller's insert. The insert adopts
+        # `[cache_protected_len, pre_len]` and stamps that node's SWA window start
+        # from the frontier this function leaves behind. If the frontier lands
+        # inside the span being adopted, the node is born with its SWA already
+        # clipped: a later first-touch request whose shared prefix ends before the
+        # cached key's end asks for a window starting below that frontier,
+        # `_clip_to_window` returns None, and the match is rejected =>
+        # `cached_tokens = 0`.
+        #
+        # So do not advance the frontier past what the tree already owns. The
+        # request keeps holding the not-yet-published span, the insert publishes
+        # it, and the tree's SWA LRU reclaims it afterwards like any other
+        # tree-owned SWA. This is a whole-span cap, not a one-window one: it is
+        # independent of `sliding_window_size`, which is what makes every D in the
+        # first-touch grid hit rather than only the tail window.
+        #
+        # `dead_lo` already bounds the frontier from below, so clamping here can
+        # only hold slots back, never release more.
+        retain_cap = dead_lo
+        evict_threshold = min(evict_threshold, retain_cap)
+
     new_evicted_seqlen = max(evicted_seqlen, evict_threshold)
 
     if page_size > 1:
         new_evicted_seqlen = (new_evicted_seqlen // page_size) * page_size
+
+    _swa_retain_detail(
+        retain_site,
+        pre_len=pre_len,
+        protected=req.kv.cache_protected_len,
+        dead_lo=dead_lo,
+        old_threshold=evict_threshold,
+        new_frontier=new_evicted_seqlen,
+        window=sliding_window_size,
+        page=page_size,
+    )
 
     if new_evicted_seqlen > evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
