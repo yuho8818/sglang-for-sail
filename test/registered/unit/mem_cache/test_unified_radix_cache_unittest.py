@@ -12094,6 +12094,42 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
                 )
                 self.assertEqual(self._matched_len(cache, prompt), matched)
 
+    def test_resubmitted_key_matches_after_a_checkpointed_insert(self):
+        """The hold-back match point of a resubmission needs the window below it,
+        which the trim before the insert must not free."""
+        page, window = 64, 32
+        cfg = CacheConfig(
+            page_size=page,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=window,
+            decoder_swa_bounded_replay=True,
+            kv_size=1024,
+            max_context_len=1024,
+        )
+        cache, allocator, pool = build_fixture(cfg)
+        # 200 tokens: the old trim keeps [128, 200) but a resubmission matches to
+        # page_floor(200 - 32) = 128 and needs [96, 128).
+        tokens = list(range(1, 201))
+        first = Req(
+            rid="first",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        first.output_ids = array("q")
+        first.refresh_fill_ids()
+        pool.alloc([first])
+        value = allocator.alloc(256)
+        self.assertIsNotNone(value)
+        pool.write((first.kv.req_pool_idx, slice(0, len(tokens))), value[: len(tokens)])
+        first.kv.kv_committed_len = len(tokens)
+        first.kv.kv_allocated_len = len(tokens)
+        first.last_node = cache.root_node_handle()
+        first.lock = cache.lock(first.last_node)
+        cache.checkpoint(first, up_to=len(tokens))
+
+        self.assertEqual(self._matched_len(cache, tokens), 128)
+
 
 if __name__ == "__main__":
     unittest.main()

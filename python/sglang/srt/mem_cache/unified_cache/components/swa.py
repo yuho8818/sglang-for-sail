@@ -1006,7 +1006,12 @@ class SWAComponent(TreeComponent):
         return effective_cache_len
 
     def _free_out_of_window_slots(
-        self, req: Req, pre_len: int, *, retain_unpublished: bool = False
+        self,
+        req: Req,
+        pre_len: int,
+        *,
+        retain_unpublished: bool = False,
+        match_hold_back: int = 0,
     ) -> None:
         if self.sliding_window_size is None:
             return
@@ -1019,6 +1024,7 @@ class SWAComponent(TreeComponent):
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
             retain_floor=self.cache.swa_retain_floor(req),
             retain_unpublished=retain_unpublished,
+            match_hold_back=match_hold_back,
         )
 
     def free_out_of_window_slots(
@@ -1028,7 +1034,13 @@ class SWAComponent(TreeComponent):
         retain = envs.SGLANG_OPT_SWA_RETAIN_UNPUBLISHED.get() and swa_pool_can_retain(
             self.cache.token_to_kv_pool_allocator, self.cache.swa_evictable_size()
         )
-        self._free_out_of_window_slots(req, pre_len, retain_unpublished=retain)
+        # No req: the hold-back a later request applies when it matches this key.
+        self._free_out_of_window_slots(
+            req,
+            pre_len,
+            retain_unpublished=retain,
+            match_hold_back=self.cache.swa_reprefill_tail_tokens(),
+        )
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )

@@ -127,6 +127,7 @@ def free_swa_out_of_window_slots(
     free_segment: Callable[..., None] | None = None,
     eviction_interval: int = 1,
     retain_unpublished: bool = False,
+    match_hold_back: int = 0,
 ) -> None:
     if not req.kv.holds_kv:
         return
@@ -162,6 +163,16 @@ def free_swa_out_of_window_slots(
         # this only promises not to free past it. Without prefix sharing a retained
         # checkpoint could never be matched, so holding it is pure cost.
         evict_threshold = min(evict_threshold, retain_floor)
+
+    if match_hold_back > 0 and supports_prefix_sharing:
+        # A later request sharing this whole key matches only up to
+        # page_floor(key_len - match_hold_back) and needs a live window below that
+        # point; trimming it leaves the reused node a tombstone there, so the
+        # match is rejected even for an exact resubmission.
+        hold_back_end = page_align_floor(
+            max(0, pre_len + 1 - match_hold_back), page_size
+        )
+        evict_threshold = min(evict_threshold, hold_back_end - sliding_window_size)
 
     if retain_unpublished and supports_prefix_sharing:
         # Hold the frontier at what the tree already owns. Trimming into the span

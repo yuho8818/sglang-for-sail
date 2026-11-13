@@ -283,13 +283,14 @@ class TestSwaComponentPreInsertTrim(unittest.TestCase):
     def _run(self, *, switch, free, evictable):
         calls = []
 
-        def record(req, pre_len, *, retain_unpublished=False):
+        def record(req, pre_len, *, retain_unpublished=False, match_hold_back=0):
             calls.append(retain_unpublished)
 
         comp = SimpleNamespace(
             cache=SimpleNamespace(
                 token_to_kv_pool_allocator=_FakeAllocator(free, POOL_CAPACITY),
                 swa_evictable_size=lambda: evictable,
+                swa_reprefill_tail_tokens=lambda req=None: 0,
             ),
             component_type=ComponentType.SWA,
             _free_out_of_window_slots=record,
