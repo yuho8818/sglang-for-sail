@@ -12094,10 +12094,23 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
                 )
                 self.assertEqual(self._matched_len(cache, prompt), matched)
 
+    def _alloc_paged(self, allocator, need_size):
+        """SWATokenToKVPoolAllocator.alloc() asserts page_size == 1, so a paged
+        SWA fixture allocates whole pages and maps them, as alloc_extend does."""
+        ps = self.cfg_page_size
+        aligned = ((need_size + ps - 1) // ps) * ps
+        full_indices = allocator.full_attn_allocator.alloc(aligned)
+        swa_indices = allocator.swa_attn_allocator.alloc(aligned)
+        self.assertIsNotNone(full_indices)
+        self.assertIsNotNone(swa_indices)
+        allocator.full_to_swa_index_mapping[full_indices] = swa_indices
+        return full_indices[:need_size]
+
     def test_resubmitted_key_matches_after_a_checkpointed_insert(self):
         """The hold-back match point of a resubmission needs the window below it,
         which the trim before the insert must not free."""
         page, window = 64, 32
+        self.cfg_page_size = page
         cfg = CacheConfig(
             page_size=page,
             components=(ComponentType.FULL, ComponentType.SWA),
@@ -12119,7 +12132,7 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         first.output_ids = array("q")
         first.refresh_fill_ids()
         pool.alloc([first])
-        value = allocator.alloc(256)
+        value = self._alloc_paged(allocator, len(tokens))
         self.assertIsNotNone(value)
         pool.write((first.kv.req_pool_idx, slice(0, len(tokens))), value[: len(tokens)])
         first.kv.kv_committed_len = len(tokens)
