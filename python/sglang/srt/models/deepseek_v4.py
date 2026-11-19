@@ -6234,6 +6234,14 @@ def _dequant_fp8_wo_a_streaming(
     emitted = False
 
     for name, tensor in weights:
+        if _V523S16_PROBE and ".wo_a." in name:
+            logger.info(
+                "[V523S16-PROBE raw] pid=%s name=%s dtype=%s keep_cb=%s",
+                os.getpid(),
+                name,
+                tensor.dtype,
+                keep_quantized is not None,
+            )
         if keep_quantized is not None and ".wo_a." in name:
             prefix, _, suffix = name.rpartition(".")
             if (
