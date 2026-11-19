@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
@@ -310,10 +311,50 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
     ]
 
 
+# V523-S16 diagnostic probe (env-gated, no behaviour change). Prints the value of
+# every gate condition *inside the server process*, plus the derived
+# channelwise_wo_a set size at weight-prep time. Remove once the RCA is done.
+_V523S16_PROBE = envs.SGLANG_V523S16_WOA_PROBE.get()
+
+
+def _v523s16_gate_terms(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> "list[tuple[str, object]]":
+    """Evaluate every gate condition separately, with short-circuit disabled."""
+    terms: "list[tuple[str, object]]" = []
+    terms.append(("_is_sail", _is_sail))
+    terms.append(("_FP8_WO_A_GEMM", _FP8_WO_A_GEMM))
+    terms.append(("isinstance(Mxfp4Config)", isinstance(quant_config, Mxfp4Config)))
+    terms.append(
+        (
+            "is_fp8_channelwise_layer",
+            (
+                quant_config.is_fp8_channelwise_layer(prefix)
+                if quant_config is not None
+                and hasattr(quant_config, "is_fp8_channelwise_layer")
+                else "<n/a>"
+            ),
+        )
+    )
+    terms.append(
+        (
+            "is_config_namespace_published('exec')",
+            get_context().is_config_namespace_published("exec"),
+        )
+    )
+    try:
+        terms.append(
+            ("dsv4_attn_backend", get_exec().kernel.dsv4_attn_backend)
+        )
+    except Exception as exc:  # noqa: BLE001 - probe must never raise
+        terms.append(("dsv4_attn_backend", f"<raised {type(exc).__name__}: {exc}>"))
+    return terms
+
+
 def _ppu_channelwise_wo_a_enabled(
     quant_config: Optional[QuantizationConfig], prefix: str
 ) -> bool:
-    return (
+    enabled = (
         _is_sail
         and _FP8_WO_A_GEMM
         and isinstance(quant_config, Mxfp4Config)
@@ -321,6 +362,15 @@ def _ppu_channelwise_wo_a_enabled(
         and get_context().is_config_namespace_published("exec")
         and get_exec().kernel.dsv4_attn_backend != "flashmla_mega"
     )
+    if _V523S16_PROBE:
+        logger.info(
+            "[V523S16-PROBE gate] pid=%s prefix=%s enabled=%s terms=%s",
+            os.getpid(),
+            prefix,
+            enabled,
+            _v523s16_gate_terms(quant_config, prefix),
+        )
+    return enabled
 
 
 _NPU_BF16_WO_A_GEMM = _is_npu and envs.SGLANG_OPT_NPU_BF16_WO_A_GEMM.get()
@@ -5681,6 +5731,23 @@ class DeepseekV4ForCausalLM(nn.Module):
                 for name, module in self.named_modules()
                 if isinstance(module, MQALayer) and module._ppu_channelwise_wo_a
             }
+            if _V523S16_PROBE:
+                _mqas = [
+                    (n, getattr(m, "_ppu_channelwise_wo_a", None))
+                    for n, m in self.named_modules()
+                    if isinstance(m, MQALayer)
+                ]
+                logger.info(
+                    "[V523S16-PROBE set] pid=%s type=%s wo_a_fp8=%s "
+                    "n_mqalayers=%s n_channelwise=%s n_flagged=%s sample=%s",
+                    os.getpid(),
+                    type(self).__name__,
+                    self.wo_a_fp8,
+                    len(_mqas),
+                    len(channelwise_wo_a),
+                    sum(1 for _, v in _mqas if v),
+                    sorted(channelwise_wo_a)[:3],
+                )
 
             def keep_wo_a_quantized(prefix: str) -> bool:
                 name = self.remap_weight_name_to_dpsk_hf_format(
@@ -5691,13 +5758,29 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
                 if nextn_layer_prefix is not None:
                     name = _nextn_decoder_weight_name(name, nextn_layer_prefix)
-                return name in channelwise_wo_a
+                hit = name in channelwise_wo_a
+                if _V523S16_PROBE and ".wo_a" in prefix:
+                    logger.info(
+                        "[V523S16-PROBE keep] pid=%s wo_a prefix=%s remapped=%s hit=%s",
+                        os.getpid(),
+                        prefix,
+                        name,
+                        hit,
+                    )
+                return hit
 
             weights = _prepare_deepseek_v4_weights(
                 weights,
                 self.quant_config,
                 keep_quantized=keep_wo_a_quantized if channelwise_wo_a else None,
             )
+            if _V523S16_PROBE:
+                logger.info(
+                    "[V523S16-PROBE keepquant] pid=%s type=%s keep_quantized_arg=%s",
+                    os.getpid(),
+                    type(self).__name__,
+                    "callable" if channelwise_wo_a else "None",
+                )
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 

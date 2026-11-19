@@ -1939,6 +1939,8 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    # V523-S16 diagnostic probe for the wo_a channelwise FP8 gate.
+    SGLANG_V523S16_WOA_PROBE = EnvBool(False)
     # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
     # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
     # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
