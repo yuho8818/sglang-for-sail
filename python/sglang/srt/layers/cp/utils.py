@@ -165,6 +165,15 @@ def prepare_cp_forward(forward_batch) -> None:
             extend_seqs_len=extend_lens_cpu,
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
+        # Build the MoE padding bound here, before the layer loop enqueues any
+        # GPU work. Its construction copies a Python int from pageable host
+        # memory, which CUDA makes a synchronous operation; deferring it to the
+        # first consumer inside the loop turned that into a full stream drain
+        # (28-141 ms per step). Strategies that do not cache the bound on their
+        # metadata are unaffected.
+        prepare_bound = getattr(strategy, "prepare_moe_local_token_count", None)
+        if prepare_bound is not None:
+            prepare_bound(forward_batch)
 
     # Under CP-TP group sharing the model owns the CP row layout and gathers
     # full rows for its MLPs, so their buffers keep the full-batch length.

@@ -171,16 +171,59 @@ class InterleaveCPStrategy(ContextParallelStrategy):
 
         Attention-TP localization does not split the count over CP ranks.
         Interleave's valid rows form a prefix of each padded local shard.
+
+        The device tensor is materialized once per forward in
+        :meth:`prepare_moe_local_token_count`, which runs before the layer loop.
+        Keeping the lazy fallback here preserves the original contract for any
+        caller that reaches this method with un-prepared metadata.
         """
         metadata = forward_batch.attn_cp_metadata
         if metadata.moe_local_token_count is None:
-            lengths = metadata.per_rank_logical_token or metadata.per_rank_actual_token
-            metadata.moe_local_token_count = torch.tensor(
-                lengths[self.cp_rank],
-                dtype=torch.int32,
-                device=forward_batch.input_ids.device,
-            )
+            self.prepare_moe_local_token_count(forward_batch)
         return metadata.moe_local_token_count
+
+    def prepare_moe_local_token_count(self, forward_batch) -> None:
+        """Eagerly build ``moe_local_token_count`` before the layer loop.
+
+        WHY THIS EXISTS
+        ---------------
+        Building the tensor lazily from the first consumer inside the layer loop
+        made PyTorch drain the stream at that point. ``per_rank_logical_token``
+        and ``per_rank_actual_token`` are Python ``List[int]``, so the value is a
+        Python ``int``; ``torch.tensor(python_int, device='cuda')`` copies from
+        *pageable* host memory, and the CUDA model cannot let kernels read a
+        buffer whose source may still be mutated, so that copy is made
+        synchronous. The measured cost is the copy (0.01 ms) plus a full stream
+        drain (28-141 ms) -- proportional to the work queued *ahead* of it, which
+        is why the deepest step paid the most. Doing the same construction here,
+        before any of this forward's work is enqueued, makes the drain ~free.
+
+        This mirrors ``cp/bcg/interleave_bcg.py``, which preallocates the tensor
+        once and fills it, for exactly this reason ("Graphs must read the live
+        count from the same address on each replay"). We keep eager's per-forward
+        cache (``moe_local_token_count``) rather than a graph-owned buffer so the
+        returned object identity is unchanged.
+
+        Returns a tensor identical to what the previous inline construction
+        produced: ``torch.int32``, shape ``()``, on the input-ids device, holding
+        ``(per_rank_logical_token or per_rank_actual_token)[cp_rank]``.
+
+        Under CUDA graph capture this is a no-op: a pageable H2D inside the
+        capture scope would be recorded into the graph (and can abort capture),
+        and the graph path supplies its own fixed-address buffer anyway --
+        ``interleave_bcg.InterleaveCPBCGInput.prepare`` overwrites
+        ``moe_local_token_count`` right after calling ``prepare_cp_forward``.
+        Leaving the bound unset there keeps exactly the previous behaviour.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return
+        metadata = forward_batch.attn_cp_metadata
+        lengths = metadata.per_rank_logical_token or metadata.per_rank_actual_token
+        metadata.moe_local_token_count = torch.tensor(
+            lengths[self.cp_rank],
+            dtype=torch.int32,
+            device=forward_batch.input_ids.device,
+        )
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if not forward_batch.forward_mode.is_context_parallel_extend():
