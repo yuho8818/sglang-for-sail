@@ -1285,6 +1285,12 @@ class DeepseekV4AttnBackend(
     ):
         super().__init__()
         self.model_runner = model_runner
+        # V523-S22: the FP8-compute five-in-one is selected per process from
+        # --dsv4-mega-fp8-q.  Only the MegaAttention backend acts on it; the
+        # other DSV4 backends ignore the flag and keep their own kernels.
+        self.mega_fp8_q = bool(
+            getattr(model_runner.server_args, "dsv4_mega_fp8_q", False)
+        )
         # Run at every KV store-location read; the DSpark deferred context-KV commit
         # joins its forked write there (SGLANG_DSPARK_DEFER_CONTEXT_KV).
         self.pre_kv_store_hook: Optional[Callable[[], None]] = None
