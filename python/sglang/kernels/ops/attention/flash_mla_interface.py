@@ -269,8 +269,14 @@ def flash_mla_mega_decode(
     enable_q_norm: bool = False,
     rms_norm_eps: float = 0.0,
     use_legacy: bool = True,
+    fp8_compute: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """MegaAttention decode over a paged cache: (out_fp8, out_sf, lse)."""
+    """MegaAttention decode over a paged cache: (out_fp8, out_sf, lse).
+
+    fp8_compute runs the five-in-one's GEMMs on the PPU1.5
+    E4M3xE4M3->F32 atom instead of the BF16 atom; Q is quantized to E4M3 after
+    RoPE.  Kernel selection only -- same params, same launcher, same grid.
+    """
     if _mega_import_error is not None:
         raise _MEGA_IMPORT_ERROR from _mega_import_error
     return _mega.decode(
@@ -288,6 +294,7 @@ def flash_mla_mega_decode(
         extra_topk_length=extra_topk_length,
         enable_q_norm=enable_q_norm,
         rms_norm_eps=rms_norm_eps,
+        fp8_compute=fp8_compute,
         **_MEGA_FIXED_PARAMS,
         # The PPU MegaAttention has a single kernel set and no ``use_legacy``.
         **_filter_kwargs(_mega.decode, {"use_legacy": use_legacy}),

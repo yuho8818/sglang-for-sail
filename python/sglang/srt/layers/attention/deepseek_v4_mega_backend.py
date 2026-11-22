@@ -42,6 +42,10 @@ def quantize_wo_a(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
     mega_attn: bool = True
+    # Select the FP8-compute five-in-one (E4M3 QK^T and PV) instead of
+    # the BF16 one.  Wired from --dsv4-mega-fp8-q.  Both arms use the identical
+    # launcher/params/grid; only the kernel's element type differs.
+    mega_fp8_q: bool = False
 
     def _mega_paged_prefill(
         self,
@@ -93,6 +97,7 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
             extra_indices=extra_indices,
             extra_topk_length=extra_topk_lengths,
             use_legacy=not self._swa_interleaved,
+            fp8_compute=self.mega_fp8_q,
         )
         return data, scale
 

@@ -376,6 +376,16 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    dsv4_mega_fp8_q: A[
+        bool,
+        Arg(
+            help="[PPU] Run the 'flashmla_mega' five-in-one decode kernel "
+            "with FP8 (E4M3) compute: Q is quantized to E4M3 after RoPE and both "
+            "QK^T and PV run on the PPU1.5 E4M3xE4M3->F32 MMA atom instead of the "
+            "BF16 atom. Requires --dsv4-attn-backend flashmla_mega and the H64 "
+            "decode path. Off by default, which keeps the BF16 kernel.",
+        ),
+    ] = False
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(

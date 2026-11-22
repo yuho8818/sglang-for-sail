@@ -126,6 +126,17 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             "SM100/SM103 or SAIL (PPU) sm89+."
         )
 
+    # The FP8-compute five-in-one is a PPU-only kernel variant and only
+    # exists for the MegaAttention decode path.  Fail at startup rather than
+    # silently measuring the BF16 kernel.
+    if getattr(cfg, "dsv4_mega_fp8_q", False):
+        from sglang.srt.utils.common import is_sail
+
+        assert cfg.dsv4_attn_backend == "flashmla_mega", (
+            "--dsv4-mega-fp8-q requires --dsv4-attn-backend flashmla_mega"
+        )
+        assert is_sail(), "--dsv4-mega-fp8-q requires the PPU (SAIL) FP8 kernels"
+
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported
 
