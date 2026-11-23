@@ -3385,6 +3385,27 @@ class DeepseekV4AttnBackend(
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
+        # Under prefill CP the capture batch carries the same EXTEND shape the
+        # eager path sees, so build its CP metadata exactly as eager does
+        # (`prepare_cp_forward`) before deriving the prefill metadata. Without
+        # this, `init_forward_metadata_prefill` sees cp_active=True but a None
+        # `attn_cp_metadata` and trips `assert cp_metadata is not None`.
+        #
+        # The CP-BCG mechanism (layers/cp/bcg) does the same thing, but it is
+        # gated behind `supports_prefill_cp_bcg`, which does not admit
+        # (INTERLEAVE, DSV4) yet; backends that opt into the captured-metadata
+        # contract (this one) take this entry instead, so CP metadata has to be
+        # built here as well.
+        #
+        # Rebuilt unconditionally when CP is active: a captured metadata object
+        # may be reused across shapes/buckets, and `build_metadata` derives it
+        # purely from this batch's own (capture-stable) extend lengths.
+        if is_cp_active(forward_batch):
+            from sglang.srt.layers.cp.utils import prepare_cp_forward
+
+            forward_batch.attn_cp_metadata = None
+            prepare_cp_forward(forward_batch)
+
         max_seq_len = self._prefill_graph_context_width(forward_batch)
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
@@ -3497,6 +3518,15 @@ class DeepseekV4AttnBackend(
         metadata_batch = (
             static_forward_batch if static_forward_batch is not None else forward_batch
         )
+        # Mirror the capture entry: under prefill CP the metadata batch needs its
+        # CP metadata built here too, otherwise `_build_forward_metadata` trips
+        # the same `assert cp_metadata is not None`.
+        if is_cp_active(metadata_batch):
+            from sglang.srt.layers.cp.utils import prepare_cp_forward
+
+            metadata_batch.attn_cp_metadata = None
+            prepare_cp_forward(metadata_batch)
+
         max_seq_len = self._prefill_graph_context_width(metadata_batch)
         static_metadata = self._build_forward_metadata(
             metadata_batch,
