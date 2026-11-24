@@ -1952,15 +1952,30 @@ class DeepseekV4AttnBackend(
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
         )
         graph_tail = None
+        cp_graph = None
         if for_prefill_graph:
             # Captured segments gather/scatter through persistent buffers of a
             # fixed capacity: real rows first, padding rows gather row 0 and
             # scatter to a dummy row past the extend.
-            assert not is_cp_active(forward_batch), (
-                "decoder SWA bounded replay inside the prefill CUDA graph does not "
-                "support prefill CP"
+            #
+            # Under prefill CP the tail must address *this rank's* sharded rows
+            # rather than the full extend (see LateLayerTail.global_token_indices
+            # and _late_layer_tail_cp_layout, which the eager path uses). The
+            # captured buffers keep the same shape they would without CP — one
+            # padded block per bucket — so the graph geometry is unchanged; only
+            # which rows fill it, and the block's CP metadata, differ.
+            cp_graph = (
+                self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
+                if is_cp_active(forward_batch)
+                else None
             )
-            real_rows = int(sum(tail_lens_cpu))
+            if cp_graph is not None:
+                # Every rank pads to the largest share so CP collectives inside
+                # the tail stay balanced; the padded rows are the rank's own
+                # dummy metadata rows.
+                real_rows = int(cp_graph["cp_metadata"].per_rank_actual_token[0])
+            else:
+                real_rows = int(sum(tail_lens_cpu))
             # The block is sized per captured shape: a shape of N tokens can
             # never hold more than N tail rows, so small shapes get small
             # blocks and only the shapes past the request cap use the full one.
@@ -1979,15 +1994,36 @@ class DeepseekV4AttnBackend(
                 if contiguous_start is not None
                 else token_indices
             )
-            idx_buf[:real_rows].copy_(real_idx)
+            if cp_graph is not None:
+                # Row order inside the block is the CP layout's: this rank's tail
+                # rows followed by its padding rows, which is exactly what the
+                # captured tail consumes.
+                local_idx = cp_graph["local_token_indices"]
+                idx_buf[:real_rows].copy_(local_idx)
+                scatter_buf[:real_rows].copy_(local_idx)
+                pos_buf[:real_rows].copy_(cp_graph["local_positions"])
+                loc_buf[:real_rows].copy_(forward_batch.out_cache_loc[local_idx])
+            else:
+                idx_buf[:real_rows].copy_(real_idx)
+                scatter_buf[:real_rows].copy_(real_idx)
+                pos_buf[:real_rows].copy_(forward_batch.positions[real_idx])
+                loc_buf[:real_rows].copy_(forward_batch.out_cache_loc[real_idx])
             idx_buf[real_rows:].zero_()
-            scatter_buf[:real_rows].copy_(real_idx)
             scatter_buf[real_rows:].fill_(int(forward_batch.out_cache_loc.shape[0]))
-            pos_buf[:real_rows].copy_(forward_batch.positions[real_idx])
             pos_buf[real_rows:].zero_()
-            loc_buf[:real_rows].copy_(forward_batch.out_cache_loc[real_idx])
             loc_buf[real_rows:].zero_()
             # The window floor is combined with the block-sized causal positions.
+            # Under CP the floor must follow the block's rows too: take this
+            # rank's tail rows (in the layout's order) and pad the rest, so the
+            # vector length matches real_rows instead of the global extend.
+            if cp_graph is not None:
+                local_rows = cp_graph["local_tail_rows"]
+                swa_replay_start = torch.cat(
+                    [
+                        swa_replay_start[local_rows],
+                        swa_replay_start.new_zeros(real_rows - local_rows.numel()),
+                    ]
+                )
             swa_replay_start = torch.nn.functional.pad(
                 swa_replay_start, (0, cap - real_rows)
             )
@@ -2078,6 +2114,19 @@ class DeepseekV4AttnBackend(
                 swa_out_cache_loc=swa_buf,
                 scatter_indices=scatter_buf,
                 real_rows_count=real_rows,
+                # Under prefill CP the captured rows are this rank's sharded
+                # rows; carry the same CP fields the eager tail carries so the
+                # model shards IDs consistently (see _tail_cp_routing_ids).
+                pad_rows=cp_graph["pad_rows"] if cp_graph is not None else 0,
+                cp_metadata=cp_graph["cp_metadata"] if cp_graph is not None else None,
+                local_lens_cpu=(
+                    cp_graph["local_lens_cpu"] if cp_graph is not None else None
+                ),
+                req_global=metadata.low_ratio_req_indices,
+                pos_global=metadata.low_ratio_pos_i64,
+                global_token_indices=(
+                    token_indices if cp_graph is not None else None
+                ),
             )
         elif cp_tail is None:
             # Without CP, tail rows index the full extend on this rank.
@@ -2174,6 +2223,10 @@ class DeepseekV4AttnBackend(
                 tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
             ).tolist(),
             pad_rows=pad_rows,
+            # Index of this rank's tail rows within the full tail row order; the
+            # prefill-graph path needs it to shard per-row side vectors (e.g. the
+            # SWA replay floor) the same way it shards the row indices.
+            local_tail_rows=local_tail_rows,
         )
 
     def write_tail_source_kv(
