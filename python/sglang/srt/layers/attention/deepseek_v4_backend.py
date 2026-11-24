@@ -1984,6 +1984,12 @@ class DeepseekV4AttnBackend(
             # blocks and only the shapes past the request cap use the full one.
             cap = self._prefill_graph_tail_block_rows(forward_batch)
             assert real_rows <= cap, (real_rows, cap)
+            # Under CP the block keeps the bucket's full capacity and the rank's
+            # rows are padded up to it: every downstream row vector in this
+            # metadata is sized from the block (out_cache_loc drives
+            # num_write_tokens), so the row count must be the block's, not the
+            # rank's live share. Padding rows are inert (dummy index/scatter).
+            block_rows = cap if cp_graph is not None else real_rows
             idx_buf, pos_buf, scatter_buf, swa_buf, loc_buf = (
                 buf[:cap]
                 for buf in self._prefill_graph_tail_buffers(
@@ -2021,16 +2027,18 @@ class DeepseekV4AttnBackend(
             # vector length matches real_rows instead of the global extend.
             if cp_graph is not None:
                 local_rows = cp_graph["local_tail_rows"]
+                n_local = int(local_rows.numel())
                 swa_replay_start = torch.cat(
                     [
                         swa_replay_start[local_rows],
-                        swa_replay_start.new_zeros(real_rows - local_rows.numel()),
+                        swa_replay_start.new_zeros(block_rows - n_local),
                     ]
                 )
-            swa_replay_start = torch.nn.functional.pad(
-                swa_replay_start, (0, cap - real_rows)
-            )
-            graph_tail = (real_rows, idx_buf, pos_buf, scatter_buf, swa_buf)
+            else:
+                swa_replay_start = torch.nn.functional.pad(
+                    swa_replay_start, (0, block_rows - real_rows)
+                )
+            graph_tail = (block_rows, idx_buf, pos_buf, scatter_buf, swa_buf)
             contiguous_start = None
         if graph_tail is not None:
             # The block's metadata is built the way the full prefill graph builds
@@ -2067,7 +2075,7 @@ class DeepseekV4AttnBackend(
             # largest share), so the token count and the per-row window floor
             # must describe that block, not the global extend.
             num_tokens=(
-                real_rows
+                block_rows
                 if cp_graph is not None
                 else sum(tail_lens_cpu)
             ),
