@@ -3638,11 +3638,17 @@ class DeepseekV4AttnBackend(
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         if self._prefill_graph_translates_swa_loc(static_metadata):
-            capture_metadata.core_attn_metadata.swa_out_cache_loc.copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    metadata_batch.out_cache_loc
-                )
+            fresh_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                metadata_batch.out_cache_loc
             )
+            held_loc = capture_metadata.core_attn_metadata.swa_out_cache_loc
+            if fresh_loc.shape[0] < held_loc.shape[0]:
+                # The captured buffer is bucket-sized; the replaying batch is
+                # smaller. Captured kernels read the whole block, so fill the
+                # head and leave the block's padding rows untouched.
+                held_loc[: fresh_loc.shape[0]].copy_(fresh_loc)
+            else:
+                held_loc.copy_(fresh_loc)
         self.prefill_graph_replay_batch = forward_batch
         self.forward_metadata = capture_metadata
         self._activate_request_window()
