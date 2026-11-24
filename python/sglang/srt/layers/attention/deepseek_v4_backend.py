@@ -4504,6 +4504,14 @@ class DeepseekV4AttnBackend(
                 return tail_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
         cached = core.swa_out_cache_loc if core is not None else None
+        if rows is not None:
+            # The caller writes `rows` tokens of this chunk; out_cache_loc may be
+            # the padded bucket, so hand back exactly the rows being written.
+            if cached is not None and cached.shape[0] >= rows:
+                return cached[:rows]
+            return self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc[:rows]
+            ).to(torch.int32)
         if cached is not None and cached.shape[0] == out_cache_loc.shape[0]:
             return cached
         return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
