@@ -1964,6 +1964,9 @@ class DeepseekV4AttnBackend(
             # captured buffers keep the same shape they would without CP — one
             # padded block per bucket — so the graph geometry is unchanged; only
             # which rows fill it, and the block's CP metadata, differ.
+            # The CP layout needs the per-request tail lengths as a device tensor; it is
+            # also built further below for the non-CP paths, so make it once here.
+            tail_lens = async_h2d(tail_lens_cpu, dtype=torch.int32, device=device)
             cp_graph = (
                 self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
                 if is_cp_active(forward_batch)
@@ -2041,7 +2044,9 @@ class DeepseekV4AttnBackend(
                 token_indices=token_indices,
                 contiguous_start=contiguous_start,
             )
-        tail_lens = async_h2d(tail_lens_cpu, dtype=torch.int32, device=device)
+        if not for_prefill_graph:
+            # The graph path already built this tensor for its CP layout.
+            tail_lens = async_h2d(tail_lens_cpu, dtype=torch.int32, device=device)
         cp_tail = (
             self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
             if is_cp_active(forward_batch)
