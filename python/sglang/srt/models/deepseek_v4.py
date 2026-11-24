@@ -2655,12 +2655,18 @@ class MQALayer(MqaAttentionBase):
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
-                tail = attn_backend.forward_metadata.late_layer_tail
+                # kv is the whole logical chunk in global order, so its
+                # positions must cover that same span. The decoder tail's
+                # pos_global is tail-sized and would not match; the metadata's
+                # block-sized global positions are the ones for this write.
+                block_positions = attn_backend.forward_metadata.low_ratio_pos_i64
                 global_positions = (
-                    tail.pos_global
-                    if tail is not None
+                    block_positions
+                    if block_positions is not None
+                    and block_positions.shape[0] >= kv.shape[0]
                     else forward_batch.positions[: kv.shape[0]]
                 )
+                global_positions = global_positions[: kv.shape[0]].to(torch.int64)
                 get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
                     layer_id=self.layer_id,
                     # kv was just materialized in the global logical order, so the
