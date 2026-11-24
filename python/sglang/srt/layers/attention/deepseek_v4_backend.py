@@ -1984,14 +1984,17 @@ class DeepseekV4AttnBackend(
             # blocks and only the shapes past the request cap use the full one.
             cap = self._prefill_graph_tail_block_rows(forward_batch)
             assert real_rows <= cap, (real_rows, cap)
-            # Under CP the block keeps the bucket's full capacity and the rank's
-            # rows are padded up to it: every downstream row vector in this
-            # metadata is sized from the block (out_cache_loc drives
-            # num_write_tokens), so the row count must be the block's, not the
-            # rank's live share. Padding rows are inert (dummy index/scatter).
-            block_rows = cap if cp_graph is not None else real_rows
+            # Under CP the block holds exactly the rank's share, padded to the
+            # largest share: `tail.rows` indexes the rank's own (already sharded)
+            # ID tensor with these local indices, so the row count here must be
+            # the rank's, not the bucket's.
+            block_rows = real_rows
+            # The captured buffers are bucket-capacity; the live block is the
+            # row count this metadata describes. Under CP that is the rank's
+            # share, so slice it here: out_cache_loc drives num_write_tokens and
+            # therefore every downstream per-row vector.
             idx_buf, pos_buf, scatter_buf, swa_buf, loc_buf = (
-                buf[:cap]
+                buf[:block_rows]
                 for buf in self._prefill_graph_tail_buffers(
                     device,
                     forward_batch.positions.dtype,
