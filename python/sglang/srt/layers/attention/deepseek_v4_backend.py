@@ -768,6 +768,19 @@ class DSV4AttnMetadata:
             if src_val is None and dst_val is None:
                 continue
             assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
+            if (
+                src_val is not None
+                and src_val.shape[:1] != dst_val.shape[:1]
+                and src_val.dim() == dst_val.dim()
+                and src_val.shape[1:] == dst_val.shape[1:]
+                and src_val.shape[0] < dst_val.shape[0]
+            ):
+                # This buffer belongs to the captured (bucket-padded) shape while
+                # the replaying batch is smaller; the captured kernels read the
+                # whole block, so pad the live rows and leave the tail as-is
+                # (those rows are padding and are masked out downstream).
+                dst_val[: src_val.shape[0]].copy_(src_val)
+                continue
             dst_val.copy_(src_val)
 
         # Safe to replace: captured kernels read only the per-replay objects, or
