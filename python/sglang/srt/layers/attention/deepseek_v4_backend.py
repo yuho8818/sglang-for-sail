@@ -3203,10 +3203,17 @@ class DeepseekV4AttnBackend(
             extend_seq_lens_cpu = tail.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
         num_global_queries = sum(extend_seq_lens_cpu)
+        # A CP tail holds this rank's rows, so the offsets it covers are the
+        # rank's share rather than the global query count: the same comparison
+        # must be made against the CP-local row count the tail was built for.
+        num_cp_local_queries = (
+            len(tail.cp_metadata.per_rank_actual_token) and
+            int(tail.cp_metadata.per_rank_actual_token[0])
+        ) if (tail is not None and tail.cp_metadata is not None) else None
         legacy_cp = (
             is_sail()
             and can_dsa_prefill_cp_round_robin_split(forward_batch)
-            and tail is None
+            and (tail is None or num_cp_local_queries is not None)
         )
         if not legacy_cp:
             assert num_qo_tokens >= num_global_queries, (

@@ -440,9 +440,13 @@ class SparsePrefillChunkCache:
         gather = self.compressed[compress_ratio]
         topk = sparse_raw_indices.shape[-1]
         width = combined_topk_width(topk, self.swa_window_size)
-        if compress_ratio in (1, 2) and width in self.low_ratio_combined:
+        # Keyed by (width, rows): the same width can be requested with different
+        # row counts (a CP tail block is a different row count than the full
+        # prefill it follows), and a buffer is written whole per call.
+        combined_key = (width, self.num_qo_tokens)
+        if compress_ratio in (1, 2) and combined_key in self.low_ratio_combined:
             gather.combined_indices, gather.combined_lens = self.low_ratio_combined[
-                width
+                combined_key
             ]
         if gather.combined_indices is None:
             device = self.seq_lens.device
@@ -456,7 +460,7 @@ class SparsePrefillChunkCache:
                 self.num_qo_tokens, dtype=torch.int32, device=device
             )
         if compress_ratio in (1, 2):
-            self.low_ratio_combined[width] = (
+            self.low_ratio_combined[combined_key] = (
                 gather.combined_indices,
                 gather.combined_lens,
             )
