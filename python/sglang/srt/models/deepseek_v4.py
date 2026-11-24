@@ -2663,7 +2663,11 @@ class MQALayer(MqaAttentionBase):
                 )
                 get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
                     layer_id=self.layer_id,
-                    swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+                    # kv was just materialized in the global logical order, so the
+                    # write locations must address that same row space.
+                    swa_loc=attn_backend.get_swa_out_cache_loc(
+                        forward_batch, rows=int(kv.shape[0])
+                    ),
                     kv=kv,
                     kv_weight=self.kv_norm.weight.data,
                     eps=self.eps,

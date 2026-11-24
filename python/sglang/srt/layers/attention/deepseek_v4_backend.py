@@ -4468,10 +4468,17 @@ class DeepseekV4AttnBackend(
             return
         self.prefill_candidates.publish_prefill_graph(inputs, x.shape[0], table)
 
-    def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+    def get_swa_out_cache_loc(
+        self, forward_batch: ForwardBatch, rows: Optional[int] = None
+    ) -> torch.Tensor:
         """Idle never trusts its metadata, which may be stale or unset: it writes
         the request window's idle layout, or translates the zero-padded
-        out_cache_loc to the dummy slot."""
+        out_cache_loc to the dummy slot.
+
+        ``rows`` names the row space the caller is writing in. A decoder tail
+        writes its own (CP-local) rows, but a caller that materialized the whole
+        logical chunk -- the CP KV store path -- needs the global rows; without
+        it the tail-sized location vector would be paired with global KV."""
         join_in_graph_metadata_prep()
         if self.pre_kv_store_hook is not None:
             self.pre_kv_store_hook()
@@ -4489,9 +4496,12 @@ class DeepseekV4AttnBackend(
             window.activate(layout)
             return layout.write_loc
         if isinstance(metadata, DSV4Metadata) and metadata.late_layer_tail is not None:
+            tail_loc = metadata.late_layer_tail.swa_out_cache_loc
             # The tail's q rows are a subset of the extend, so the full
-            # out_cache_loc below would be the wrong length; the tail owns its own.
-            return metadata.late_layer_tail.swa_out_cache_loc
+            # out_cache_loc below would be the wrong length; the tail owns its
+            # own -- unless the caller asked for the global rows it materialized.
+            if rows is None or tail_loc.shape[0] == rows:
+                return tail_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
         cached = core.swa_out_cache_loc if core is not None else None
         if cached is not None and cached.shape[0] == out_cache_loc.shape[0]:
