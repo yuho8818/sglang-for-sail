@@ -4827,6 +4827,21 @@ class DeepseekV4AttnBackend(
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
+        # Under prefill CP the low-ratio indexer scores this rank's sharded rows
+        # (`_forward_low_ratio_sources_cp` slices its input to `num_local`), and
+        # the per-query indices it produces -- and `flash_mla_sparse_fwd`, which
+        # requires indices.size(0) == q.size(0) -- are in that same row space.
+        # Attention therefore consumes the same rows: slice q to the rank's rows
+        # so both sides describe one row set.
+        cp_tail = self.forward_metadata.late_layer_tail
+        full_q_rows = q_flat.shape[0]
+        cp_local_rows = None
+        if cp_tail is not None and cp_tail.local_lens_cpu is not None:
+            num_local = sum(cp_tail.local_lens_cpu)
+            if num_local < q_flat.shape[0]:
+                q_flat = q_flat[:num_local]
+                cp_local_rows = num_local
+
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
             cache = self._build_sparse_prefill_chunk_cache(
@@ -4924,7 +4939,7 @@ class DeepseekV4AttnBackend(
                 topk_length=combined_lens,
                 compute_aux=False,
             )
-            return o
+            return self._sparse_prefill_scatter_rows(o, cp_local_rows, full_q_rows)
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,
             kv=kv,
@@ -4934,7 +4949,22 @@ class DeepseekV4AttnBackend(
             attn_sink=attn_sink,
             topk_length=combined_lens,
         )
-        return o
+        return self._sparse_prefill_scatter_rows(o, cp_local_rows, full_q_rows)
+
+    def _sparse_prefill_scatter_rows(
+        self, o: torch.Tensor, cp_local_rows: Optional[int], full_rows: int
+    ) -> torch.Tensor:
+        """Place the CP-local attention result back into the caller's row space.
+
+        Under prefill CP the sparse prefill path scores and attends this rank's
+        sharded rows, but the model hands the attention layer the whole extend.
+        Rows the rank does not own keep zeros: they are padding for the CP
+        collectives and are not read back as this rank's tokens."""
+        if cp_local_rows is None or o.shape[0] == full_rows:
+            return o
+        out = o.new_zeros((full_rows, *o.shape[1:]))
+        out[: o.shape[0]] = o
+        return out
 
     def _prepare_q8kv8_q_and_sink(
         self,
