@@ -4833,14 +4833,13 @@ class DeepseekV4AttnBackend(
         # requires indices.size(0) == q.size(0) -- are in that same row space.
         # Attention therefore consumes the same rows: slice q to the rank's rows
         # so both sides describe one row set.
-        cp_tail = self.forward_metadata.late_layer_tail
         full_q_rows = q_flat.shape[0]
-        cp_local_rows = None
-        if cp_tail is not None and cp_tail.local_lens_cpu is not None:
-            num_local = sum(cp_tail.local_lens_cpu)
-            if num_local < q_flat.shape[0]:
-                q_flat = q_flat[:num_local]
-                cp_local_rows = num_local
+        cp_local_rows = self._sparse_prefill_cp_local_rows(forward_batch, full_q_rows)
+        if cp_local_rows is not None:
+            # The low-ratio indexer produced its top-k over these same rows
+            # (`_forward_low_ratio_sources_cp`), and flash_mla_sparse_fwd requires
+            # indices.size(0) == q.size(0); attend the rank's rows.
+            q_flat = q_flat[:cp_local_rows]
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
@@ -4950,6 +4949,27 @@ class DeepseekV4AttnBackend(
             topk_length=combined_lens,
         )
         return self._sparse_prefill_scatter_rows(o, cp_local_rows, full_q_rows)
+
+    def _sparse_prefill_cp_local_rows(
+        self, forward_batch: ForwardBatch, q_rows: int
+    ) -> Optional[int]:
+        """Rows the sparse prefill path should attend under prefill CP.
+
+        The low-ratio indexer runs on this rank's sharded rows whenever CP owns
+        the batch (`_forward_low_ratio_sources_cp` slices its input), so the
+        top-k it publishes is in that row space. Attention has to match it.
+        Returns None when CP is inactive or the full row set already applies."""
+        if not is_cp_active(forward_batch):
+            return None
+        tail = self.forward_metadata.late_layer_tail
+        if tail is not None and tail.local_lens_cpu is not None:
+            rows = sum(tail.local_lens_cpu)
+        else:
+            meta = forward_batch.attn_cp_metadata
+            if meta is None or meta.per_rank_actual_token is None:
+                return None
+            rows = int(meta.per_rank_actual_token[0])
+        return rows if rows < q_rows else None
 
     def _sparse_prefill_scatter_rows(
         self, o: torch.Tensor, cp_local_rows: Optional[int], full_rows: int
