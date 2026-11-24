@@ -61,6 +61,17 @@ def fused_engram_gate(
     t, hc, d = x.shape
     assert kv.shape == (t, (hc + 1) * d)
     assert q_weight.shape == k_weight.shape == (hc, d)
+    if not (
+        input_ids is None
+        or (input_ids.shape == (t,) and input_ids.is_cuda and image_token_id is not None)
+    ):
+        print(
+            f"[S29-DIAG][engram_gate] x.shape={tuple(x.shape)} t={t} "
+            f"kv.shape={tuple(kv.shape)} input_ids.shape="
+            f"{None if input_ids is None else tuple(input_ids.shape)} "
+            f"image_token_id={image_token_id}",
+            flush=True,
+        )
     assert input_ids is None or (
         input_ids.shape == (t,) and input_ids.is_cuda and image_token_id is not None
     )

@@ -4284,6 +4284,21 @@ class DeepseekV4Model(nn.Module):
             if cp_extend
             else input_ids
         )
+        # Engram gates ``state.residual`` with these IDs, so they must carry one
+        # entry per residual row. On the prefill-graph capture path the residual
+        # is not CP-sharded (the model is fed the full extend), while the shard
+        # above is — pad it back up the same way ``hash_ids`` is padded to
+        # ``hidden_states.shape[0]`` just below.
+        if cp_extend and local_input_ids.shape[0] < hidden_states.shape[0]:
+            local_input_ids = torch.cat(
+                [
+                    local_input_ids,
+                    local_input_ids.new_zeros(
+                        (hidden_states.shape[0] - local_input_ids.shape[0],)
+                        + tuple(local_input_ids.shape[1:])
+                    ),
+                ]
+            )
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
