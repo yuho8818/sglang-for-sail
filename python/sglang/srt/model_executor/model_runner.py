@@ -314,10 +314,26 @@ class SamplingPrewarmResult:
 def _prefill_cuda_graph_allows_context_parallel(
     prefill_runner, forward_batch: ForwardBatch
 ) -> bool:
-    """Allow CP only through a runner that captured the validated CP body."""
-    return get_cp_strategy() is None or (
-        bool(getattr(prefill_runner, "enable_cp_bcg_capture", False))
-        and is_cp_active(forward_batch)
+    """Allow CP only through a runner that captured a CP-aware body.
+
+    Two runner shapes capture a body that can replay a CP batch:
+
+    * the CP-BCG input path (``enable_cp_bcg_capture``), which shards the global
+      prefill inputs into fixed CP-local buffers before capture, and
+    * a backend that opted into the captured-metadata contract
+      (``use_captured_attn_metadata``, e.g. DSV4), whose capture entry builds the
+      batch's CP metadata itself and whose replay refreshes it in place.
+
+    Both keep the captured rows and the batch's CP layout consistent; without one
+    of them the graph body holds unsharded rows and must not replay a CP batch.
+    """
+    if get_cp_strategy() is None:
+        return True
+    if not is_cp_active(forward_batch):
+        return False
+    return bool(
+        getattr(prefill_runner, "enable_cp_bcg_capture", False)
+        or getattr(prefill_runner, "use_captured_attn_metadata", False)
     )
 
 
