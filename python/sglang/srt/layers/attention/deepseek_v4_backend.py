@@ -2063,14 +2063,27 @@ class DeepseekV4AttnBackend(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=seq_lens_cpu.tolist(),
             out_cache_loc=out_cache_loc,
-            num_tokens=sum(tail_lens_cpu),
+            # Under CP the tail block holds this rank's rows (padded to the
+            # largest share), so the token count and the per-row window floor
+            # must describe that block, not the global extend.
+            num_tokens=(
+                real_rows
+                if cp_graph is not None
+                else sum(tail_lens_cpu)
+            ),
             extend_seq_lens=tail_lens,
             extend_seq_lens_cpu=tail_lens_cpu,
             extend_start_loc=torch.cumsum(tail_lens, dim=0) - tail_lens,
             swa_replay_start=swa_replay_start,
             use_prefill_cuda_graph=graph_tail is not None,
-            forward_batch=forward_batch if cp_tail is not None else None,
-            cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
+            forward_batch=(
+                forward_batch if (cp_tail is not None or cp_graph is not None) else None
+            ),
+            cp_metadata=(
+                cp_tail["cp_metadata"]
+                if cp_tail is not None
+                else (cp_graph["cp_metadata"] if cp_graph is not None else None)
+            ),
         )
         swa_out_cache_loc = (
             metadata.core_attn_metadata.request_window_layout.write_loc
