@@ -64,6 +64,10 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
         )
     platform = get_platform()
     if platform.is_ppu:
+        if envs.SGLANG_OPT_ULTRA_EP_PPU.get():
+            from sglang.srt.hardware_backend.ppu.moe.ultra_ep import validate_config
+
+            validate_config(cfg, platform)
         if platform.device_sm < 89:
             raise ValueError("--moe-a2a-backend megamoe on PPU requires SM89 or newer.")
         _require_ppu_mega_moe_deep_gemm_apis()

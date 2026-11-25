@@ -1523,6 +1523,11 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    # PPU prefill: dynamically replicate hot experts through UltraEP while
+    # MegaMoE retains dispatch, GEMMs and combine. One replica pool spans layers.
+    SGLANG_OPT_ULTRA_EP_PPU = EnvBool(True)
+    SGLANG_OPT_ULTRA_EP_PPU_REDUNDANT_PER_RANK = EnvInt(2)
+    SGLANG_OPT_ULTRA_EP_PPU_MIN_TOKENS_PER_RANK = EnvInt(1024)
 
     # ===================================================================
     # Top-k kernels

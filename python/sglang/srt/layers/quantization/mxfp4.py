@@ -1189,6 +1189,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer._mega_moe_mma_type = mma_type
                     layer._mega_moe_weights_built = True
                     layer._mxfp4_backend = "deep_gemm"
+                    if envs.SGLANG_OPT_ULTRA_EP_PPU.get() and mma_type in (
+                        "fp4xfp4",
+                        "bf16xfp4",
+                    ):
+                        from sglang.srt.hardware_backend.ppu.moe.ultra_ep import (
+                            register_weights,
+                        )
+
+                        register_weights(layer)
                     torch.cuda.empty_cache()
                     return
                 if self.with_bias:

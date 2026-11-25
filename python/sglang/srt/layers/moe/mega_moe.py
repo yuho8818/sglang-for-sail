@@ -135,28 +135,39 @@ def _get_mega_moe_symm_buffer(
     *,
     mma_type: str,
     activation: str = "swiglu",
+    workspace_expert_counts: Optional[tuple[int, int]] = None,
 ) -> SymmBuffer:
     import deep_gemm
+
+    storage_num_experts = num_experts
+    if workspace_expert_counts is not None:
+        logical_experts, storage_num_experts = workspace_expert_counts
+        if not (
+            _is_sail
+            and mma_type == "fp4xfp4"
+            and 0 < logical_experts < storage_num_experts
+            and num_experts in workspace_expert_counts
+        ):
+            raise ValueError("PPU W4A4 workspace views need logical/physical experts")
 
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         key = (
             id(group),
             num_max_tokens_per_rank,
-            num_experts,
+            storage_num_experts,
             num_topk,
             hidden,
             intermediate_hidden,
             mma_type,
             activation,
             num_shared_experts,
-            activation,
             deep_gemm.get_num_sms(),
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
         if buf is None:
             buf = deep_gemm.get_symm_buffer_for_mega_moe(
                 group,
-                num_experts,
+                storage_num_experts,
                 num_max_tokens_per_rank,
                 num_topk,
                 hidden,
@@ -166,6 +177,28 @@ def _get_mega_moe_symm_buffer(
                 activation=activation,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
+        if workspace_expert_counts is not None:
+            # Build both layouts before the first execution/capture, even when
+            # UltraEP runs first. DeepGEMM keeps staging and protocol state at
+            # common offsets while each view retains its own expert layout.
+            view_key = key + (logical_experts,)
+            view = _MEGA_MOE_SYMM_BUFFER.get(view_key)
+            if view is None:
+                view = deep_gemm.SymmBuffer(
+                    group,
+                    logical_experts,
+                    num_max_tokens_per_rank,
+                    num_topk,
+                    hidden,
+                    intermediate_hidden,
+                    num_shared_experts=num_shared_experts,
+                    mma_type=mma_type,
+                    activation=activation,
+                    base=buf,
+                )
+                _MEGA_MOE_SYMM_BUFFER[view_key] = view
+            if num_experts == logical_experts:
+                return view
     return buf
 
 
@@ -438,6 +471,16 @@ def _run_mega_routed(
             else float(moe.routed_scaling_factor)
         )
 
+    use_ultra_ep = False
+    if (
+        _is_sail
+        and envs.SGLANG_OPT_ULTRA_EP_PPU.get()
+        and getattr(moe.experts, "_ultra_ep_manager", None) is not None
+    ):
+        from sglang.srt.hardware_backend.ppu.moe.ultra_ep import use_for_batch
+
+        use_ultra_ep = use_for_batch(forward_batch)
+
     return run_mega_routed_experts(
         moe.experts,
         hidden_states,
@@ -455,6 +498,7 @@ def _run_mega_routed(
         shared_l1_weights=moe.mega_shared_l1_weights,
         shared_l2_weights=moe.mega_shared_l2_weights,
         routing_in_buffer=routing is not None and routing.in_buffer,
+        use_ultra_ep=use_ultra_ep,
     )
 
 
@@ -475,6 +519,7 @@ def run_mega_routed_experts(
     shared_l1_weights=None,
     shared_l2_weights=None,
     routing_in_buffer: bool = False,
+    use_ultra_ep: bool = False,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
@@ -494,18 +539,6 @@ def run_mega_routed_experts(
     )
 
     mma_type = _mega_moe_mma_type(experts)
-    buf = _get_mega_moe_symm_buffer(
-        ep_group,
-        num_experts=num_experts,
-        num_max_tokens_per_rank=num_max_tokens_per_rank,
-        num_topk=top_k,
-        hidden=hidden_size,
-        intermediate_hidden=intermediate_size,
-        num_shared_experts=num_shared_experts,
-        mma_type=mma_type,
-        activation=activation,
-    )
-
     topk_ids_dtype = torch.int64 if _is_sail else torch.int32
     if routing_in_buffer:
         assert num_tokens > 0 and _device_sm != 90 and mma_type == "fp8xfp4"
@@ -516,6 +549,39 @@ def run_mega_routed_experts(
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=topk_ids_dtype)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+
+    ultra = None
+    if _is_sail and use_ultra_ep and envs.SGLANG_OPT_ULTRA_EP_PPU.get():
+        from sglang.srt.hardware_backend.ppu.moe.ultra_ep import prepare
+
+        # Every EP rank participates, including empty CP shards. Keep this
+        # decision independent of the rank's token count or local forward mode.
+        assert not routing_in_buffer
+        ultra = prepare(experts, topk_ids_in)
+        topk_ids_in = ultra.topk_ids
+        num_experts = ultra.num_experts
+
+    workspace_expert_counts = None
+    manager = getattr(experts, "_ultra_ep_manager", None)
+    if _is_sail and mma_type == "fp4xfp4" and manager is not None:
+        # Registration precedes warmup. Native small/decode calls must use the
+        # same allocation too, before any graph records its input pointers.
+        workspace_expert_counts = (
+            experts.num_experts,
+            manager.num_global_physical_experts,
+        )
+    buf = _get_mega_moe_symm_buffer(
+        ep_group,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        num_topk=top_k,
+        hidden=hidden_size,
+        intermediate_hidden=intermediate_size,
+        num_shared_experts=num_shared_experts,
+        mma_type=mma_type,
+        activation=activation,
+        workspace_expert_counts=workspace_expert_counts,
+    )
 
     if not _is_sail and _device_sm == 90:
         return run_sm90_mega_routed(
@@ -641,6 +707,11 @@ def run_mega_routed_experts(
         # PPU's fp4_fp4_mega_moe takes the shared experts outside the kernel.
         kernel_kwargs["shared_l1_weights"] = shared_l1_weights
         kernel_kwargs["shared_l2_weights"] = shared_l2_weights
+    if ultra is not None:
+        # Quantization/pre-dispatch can overlap the asynchronous peer pull.
+        # The shared replica pool must be ready before either GEMM consumes it.
+        ultra.weight_event.current_stream_wait()
+        kernel_kwargs.update(ultra.kernel_kwargs)
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         if _is_sail:
             mega_moe_kernel = {
