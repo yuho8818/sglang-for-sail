@@ -5125,6 +5125,13 @@ class DeepseekV4AttnBackend(
             )
             self._q8kv8_sparse_prefill_log_emitted = True
 
+        # Same CP row space as the bf16 sparse path: the indexer scored this
+        # rank's sharded rows, so attend those and scatter back afterwards.
+        full_q_rows = q_flat.shape[0]
+        cp_local_rows = self._sparse_prefill_cp_local_rows(forward_batch, full_q_rows)
+        if cp_local_rows is not None:
+            q_flat = q_flat[:cp_local_rows]
+
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
             cache = self._build_sparse_prefill_chunk_cache(
@@ -5197,7 +5204,9 @@ class DeepseekV4AttnBackend(
             topk_length=combined_lens,
         )
 
-        return o[:, :active_heads]
+        return self._sparse_prefill_scatter_rows(
+            o[:, :active_heads], cp_local_rows, full_q_rows
+        )
 
     def expand_prefill_casually(
         self,
