@@ -62,6 +62,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_MAX_BYTES_ROCM,
     MQA_LOGITS_STATIC_SKIP_ELEMS,
     MQA_LOGITS_TOTAL_MEM_FRACTION,
+    SailPagedMQAMetadata,
     mqa_logits_budget_bytes,
     mqa_logits_free_mem_fraction,
     mqa_logits_row_bytes,
@@ -245,12 +246,6 @@ def _check_logits_nan_in_valid_range(
             f"Likely upstream mqa_logits kernel bug."
         )
 
-
-if is_sail():
-    print("<SAIL>: skipping dsa indexer optimization, fallback to original path")
-    SKIP_OPT_PATH = True
-else:
-    SKIP_OPT_PATH = False
 
 if _is_cuda:
     from sglang.kernels.ops.attention.dsa.indexer_k import (
@@ -904,13 +899,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ):
         # FP4 indexer path: per-block Q scales travel alongside Q values, so
         # there is no per-token scalar to fold into the head-gate weights.
-        # DeepGEMM's fp8_fp4_mqa_logits requires fp32 weights — the FP8 path
-        # lands on fp32 naturally via promote_types(bf16, fp32 q_scale); here
-        # we have to pin the cast explicitly.
+        # Both paged and ragged MQA consume BF16 weights on this path.
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * self.softmax_scale
-        return weights.to(torch.float32)
+        return weights.to(torch.bfloat16)
 
     @torch.compile(dynamic=True)
     def _apply_q_scale_and_softmax_scale(
@@ -1188,6 +1181,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
+        if self.bf16_indexer:
+            return False
         # topk_transform selects every valid page slot when kv_len <= index_topk;
         # logits are unnecessary in that case.
         fb = forward_batch
@@ -1209,8 +1204,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
                 # No variant means the full indexer path for any context length.
                 return get_capture_attention_variant() == DSA_DENSE
-            # Eager k-only decode skip is validated on ROCm only.
-            if not _is_hip:
+            # Eager k-only decode skip is validated on ROCm and PPU.
+            if not (_is_hip or is_sail()):
                 return False
             if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
                 max_kv_len = int(fb.seq_lens_cpu.max().item())
@@ -1337,7 +1332,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights: torch.Tensor,
         context_lens: torch.Tensor,
         block_table: torch.Tensor,
-        schedule_meta: torch.Tensor,
+        schedule_meta: Optional[torch.Tensor | SailPagedMQAMetadata],
         max_context_len: int,
         clean_logits: bool = True,
         indices: Optional[torch.Tensor] = None,
@@ -2084,7 +2079,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 row_weights,
                 seqlens_32_2d[:q_offset],
                 block_tables[:q_offset],
-                None,
+                schedule_metadata if self.use_fp4 else None,
                 max_seq_len,
                 clean_logits=False,
                 indices=request_indices,
@@ -3170,6 +3165,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
+        forward_mode = forward_batch.forward_mode
+        use_paged_topk = (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        )
 
         # Determine if should skip topk based on sequence length
         # We can only skip the logits computation if cuda graph is not involved
@@ -3178,9 +3179,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             skip_logits_computation = self._should_skip_logits_computation(
                 forward_batch
             )
-
-        if SKIP_OPT_PATH:
-            skip_logits_computation = False
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):
@@ -3348,12 +3346,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_fp8 = (q_packed, q_sf)
                 q_scale = None
                 k_fp8, k_scale = None, None
-                self._store_index_k_cache(
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    key=key,
-                    act_quant=act_quant,
-                )
+                store_on_alt_stream = enable_dual_stream and use_paged_topk
+                main_stream = torch.cuda.current_stream()
+                store_stream = self.alt_stream if store_on_alt_stream else None
+                with torch.cuda.stream(store_stream):
+                    self._store_index_k_cache(
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                        key=key,
+                        act_quant=act_quant,
+                    )
+                if store_on_alt_stream:
+                    # Wait for the K cache write before MQA reads it on the main stream.
+                    main_stream.wait_stream(self.alt_stream)
 
             elif self.bf16_indexer:
                 q_fp8, q_scale = query, 1
@@ -3518,11 +3523,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
                     return maybe_capture_indexer_topk(layer_id, topk_result)
 
-            if (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
+            if use_paged_topk:
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )

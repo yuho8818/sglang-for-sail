@@ -45,7 +45,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
-    _validate_efa_allocator_compatibility,
+    _validate_mooncake_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import (
@@ -271,7 +271,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         enable_custom_mem_pool, custom_mem_pool_type = (
             check_mooncake_custom_mem_pool_enabled()
         )
-        _validate_efa_allocator_compatibility(
+        _validate_mooncake_allocator_compatibility(
             enable_custom_mem_pool, custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
@@ -394,6 +394,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+        if self.engine is None:
+            raise RuntimeError("Mooncake transfer engine is not initialized")
 
     def _registerable_regions(self) -> List[Tuple[int, int]]:
         """(ptr, len) regions to (de)register, exact duplicates removed.
@@ -428,10 +430,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return regions
 
     def register_buffer_to_engine(self):
-        regions = self._registerable_regions()
-        if regions:
-            ptrs, lens = zip(*regions)
-            self.engine.batch_register(list(ptrs), list(lens))
+        # Mooncake's batch_register_memory only logs per-region failures and
+        # still returns 0, so register one by one to fail loud.
+        for ptr, length in self._registerable_regions():
+            self.engine.register(ptr, length)
 
     def deregister_buffer_to_engine(self):
         regions = self._registerable_regions()
@@ -556,7 +558,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         }
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
-        self.engine.batch_register([ptr], [size])
+        self.engine.register(ptr, size)
+
+    def _deregister_staging_memory(self, ptr: int) -> None:
+        self.engine.deregister(ptr)
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -3178,6 +3183,41 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         except Exception as exc:
             logger.debug("Failed to send ABORT_ACK for room %s: %s", room, exc)
 
+    def _register_prefill_peer(
+        self, mooncake_session_id: str, decode_kv_args: KVArgsRegisterInfo
+    ) -> Optional[str]:
+        decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+            decode_kv_args.dst_dcp_size,
+            decode_kv_args.dst_dcp_rank,
+        )
+        pack_buffer_failure = None
+        if decode_kv_args.requires_dcp_relayout:
+            num_entries = len(self.kv_args.kv_item_lens)
+            num_draft = self.kv_args.num_draft_entries
+            dst_item_lens: List[Optional[int]] = [decode_kv_args.dst_kv_item_len] * (
+                num_entries - num_draft
+            ) + [None] * num_draft
+            decode_kv_args.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
+                dst_item_lens,
+                decode_kv_args.dst_dcp_size,
+                draft_rows_collapsed=decode_kv_args.dst_draft_rows_dcp_collapsed,
+            )
+            try:
+                self._init_dcp_pack_buffers_once(
+                    decode_kv_args.dst_dcp_size, include_draft=True
+                )
+            except Exception as exc:
+                pack_buffer_failure = f"DCP pack buffer initialization failed: {exc}"
+
+        layout_mismatch = self._publish_peer_registration(
+            mooncake_session_id, decode_kv_args
+        )
+        if pack_buffer_failure is not None:
+            with self.session_lock:
+                self.state_layout_rejections[mooncake_session_id] = pack_buffer_failure
+            return pack_buffer_failure
+        return layout_mismatch
+
     def start_prefill_thread(self):
         recv = self._make_worker_recv(self.server_socket)
 
@@ -3202,25 +3242,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
-                    )
-                    if decode_kv_args.requires_dcp_relayout:
-                        num_entries = len(self.kv_args.kv_item_lens)
-                        num_draft = self.kv_args.num_draft_entries
-                        dst_item_lens: List[Optional[int]] = [
-                            decode_kv_args.dst_kv_item_len
-                        ] * (num_entries - num_draft) + [None] * num_draft
-                        decode_kv_args.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
-                            dst_item_lens,
-                            decode_kv_args.dst_dcp_size,
-                            draft_rows_collapsed=decode_kv_args.dst_draft_rows_dcp_collapsed,
-                        )
-                        self._init_dcp_pack_buffers_once(
-                            decode_kv_args.dst_dcp_size, include_draft=True
-                        )
-                    layout_mismatch = self._publish_peer_registration(
+                    layout_mismatch = self._register_prefill_peer(
                         mooncake_session_id, decode_kv_args
                     )
                     if layout_mismatch is not None:

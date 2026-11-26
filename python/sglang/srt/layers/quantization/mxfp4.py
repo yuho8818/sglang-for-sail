@@ -424,6 +424,13 @@ class Mxfp4Config(QuantizationConfig):
                 self.fp8_channelwise_layers
             )
 
+    def is_fp8_channelwise_layer(self, prefix: str) -> bool:
+        return bool(self.fp8_channelwise_layers) and should_ignore_layer(
+            prefix,
+            ignore=self.fp8_channelwise_layers,
+            fused_mapping=self.packed_modules_mapping,
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
@@ -437,11 +444,7 @@ class Mxfp4Config(QuantizationConfig):
         from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 
         # fp8 channelwise
-        if self.fp8_channelwise_layers and should_ignore_layer(
-            prefix,
-            ignore=self.fp8_channelwise_layers,
-            fused_mapping=self.packed_modules_mapping,
-        ):
+        if self.is_fp8_channelwise_layer(prefix):
             return W8A8Fp8Config(is_checkpoint_fp8_serialized=True).get_quant_method(
                 layer, prefix
             )
@@ -1186,6 +1189,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer._mega_moe_mma_type = mma_type
                     layer._mega_moe_weights_built = True
                     layer._mxfp4_backend = "deep_gemm"
+                    if envs.SGLANG_OPT_ULTRA_EP_PPU.get() and mma_type in (
+                        "fp4xfp4",
+                        "bf16xfp4",
+                    ):
+                        from sglang.srt.hardware_backend.ppu.moe.ultra_ep import (
+                            register_weights,
+                        )
+
+                        register_weights(layer)
                     torch.cuda.empty_cache()
                     return
                 if self.with_bias:
